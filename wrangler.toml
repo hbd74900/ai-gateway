@@ -12,4 +12,4 @@ compatibility_date = "2025-06-17"
 # Step 2: Replace the id below with the output id
 [[kv_namespaces]]
 binding = "KV"
-id = "1d97798df5d34c10b6a6bba2c6a47403"
+id = "1d97798df5d34c10b6a6bba2c6a47403_1"
