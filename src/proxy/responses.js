@@ -12,7 +12,78 @@
 /**
  * Convert a Responses API request body to Chat Completions format.
  */
+import { createParser } from 'eventsource-parser';
+
+export function observeResponsesStream(body) {
+  const reader = body.getReader();
+  const decoder = new TextDecoder();
+  let usage = null;
+  let settle;
+  let ended = false;
+  const usagePromise = new Promise(resolve => { settle = resolve; });
+  const parser = createParser({
+    maxBufferSize: 1024 * 1024,
+    onEvent(event) {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.response?.usage) {
+          usage = {
+            prompt_tokens: data.response.usage.input_tokens || 0,
+            completion_tokens: data.response.usage.output_tokens || 0,
+          };
+        }
+      } catch {}
+    },
+  });
+  function finish() {
+    if (ended) return;
+    ended = true;
+    settle(usage);
+    try { reader.releaseLock(); } catch {}
+  }
+  const stream = new ReadableStream({
+    async pull(ctrl) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) {
+          finish();
+          ctrl.close();
+          return;
+        }
+        try { parser.feed(decoder.decode(value, { stream: true })); } catch {}
+        ctrl.enqueue(value);
+      } catch (err) {
+        finish();
+        ctrl.error(err);
+      }
+    },
+    async cancel(reason) {
+      try { await reader.cancel(reason); } finally { finish(); }
+    },
+  });
+  return { stream, usagePromise };
+}
+
+export function usesNativeResponses(channel) {
+  if (channel.responses_mode === 'native') return true;
+  if (channel.responses_mode === 'chat') return false;
+  try {
+    const url = new URL(channel.base_url);
+    return url.pathname.replace(/\/+$/, '').endsWith('/responses') ||
+      (url.hostname === 'openrouter.ai' && url.pathname.replace(/\/+$/, '') === '/api/v1') ||
+      (url.hostname === 'api.openai.com' && url.pathname.replace(/\/+$/, '') === '/v1');
+  } catch {
+    return false;
+  }
+}
+
 export function responsesToChatCompletions(body) {
+  if (body.previous_response_id !== undefined && body.previous_response_id !== null) {
+    throw new Error('previous_response_id is not supported by this stateless gateway');
+  }
+  if (body.background) {
+    throw new Error('background mode is not supported by this stateless gateway');
+  }
   const messages = [];
 
   if (body.instructions) {
@@ -25,7 +96,10 @@ export function responsesToChatCompletions(body) {
     for (const item of body.input) {
       const converted = convertInputItem(item);
       if (converted) {
-        if (Array.isArray(converted)) messages.push(...converted);
+        const previous = messages[messages.length - 1];
+        if (item.type === 'function_call' && previous?.role === 'assistant' && previous.tool_calls) {
+          previous.tool_calls.push(...converted.tool_calls);
+        } else if (Array.isArray(converted)) messages.push(...converted);
         else messages.push(converted);
       }
     }
@@ -42,6 +116,7 @@ export function responsesToChatCompletions(body) {
   }
   if (body.temperature !== undefined) result.temperature = body.temperature;
   if (body.top_p !== undefined) result.top_p = body.top_p;
+  if (body.parallel_tool_calls !== undefined) result.parallel_tool_calls = body.parallel_tool_calls;
 
   if (body.tools?.length > 0) {
     result.tools = [];

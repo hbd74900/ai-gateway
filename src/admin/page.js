@@ -164,6 +164,7 @@ label{display:block;margin-bottom:6px;font-size:13px;color:var(--text-1);font-we
       <a class="nav-item active" data-section="dashboard" onclick="navigate('dashboard')"></a>
       <a class="nav-item" data-section="channels" onclick="navigate('channels')"></a>
       <a class="nav-item" data-section="usage" onclick="navigate('usage')"></a>
+      <a class="nav-item" data-section="freemodels" onclick="navigate('freemodels')"></a>
       <a class="nav-item" data-section="apikeys" onclick="navigate('apikeys')"></a>
     </nav>
     <div class="sidebar-footer">
@@ -216,6 +217,21 @@ label{display:block;margin-bottom:6px;font-size:13px;color:var(--text-1);font-we
       <div style="margin-top:32px">
         <div class="section-header"><h2 id="error-title"></h2></div>
         <div id="error-container"></div>
+      </div>
+    </section>
+
+    <!-- Free Models -->
+    <section id="section-freemodels" class="section" style="display:none">
+      <div class="section-header">
+        <h2 id="fm-title"></h2>
+        <button class="btn btn-ghost" onclick="loadFreeModels(true)" id="fm-refresh-btn"></button>
+      </div>
+      <div id="fm-meta" class="form-help" style="margin-bottom:12px"></div>
+      <div class="table-container">
+        <table>
+          <thead><tr id="fm-thead"></tr></thead>
+          <tbody id="fm-tbody"></tbody>
+        </table>
       </div>
     </section>
 
@@ -367,6 +383,21 @@ const I18N = {
     sourceUpstream: 'Upstream',
     sourceChannel: 'Channel fallback',
     sourceNone: 'None',
+    freeModels: 'Free Models',
+    fmRefresh: 'Refresh Catalog',
+    fmModel: 'Model ID',
+    fmName: 'Name',
+    fmContext: 'Context',
+    fmTools: 'Tools',
+    fmActions: 'Actions',
+    fmUseInChannel: 'Use in Channel',
+    fmNoModels: 'No free models available. Click Refresh to fetch.',
+    fmFetchFailed: 'Failed to fetch free models',
+    fmSource: 'Source',
+    fmFetchedAt: 'Fetched at',
+    fmCached: 'cached',
+    fmFresh: 'live',
+    fmCount: 'models',
   },
   zh: {
     loginSub: '请输入管理员密码或 API Key 继续',
@@ -488,6 +519,21 @@ const I18N = {
     sourceUpstream: '上游实时',
     sourceChannel: '渠道兜底',
     sourceNone: '无',
+    freeModels: '免费模型',
+    fmRefresh: '刷新目录',
+    fmModel: '模型 ID',
+    fmName: '名称',
+    fmContext: '上下文',
+    fmTools: '工具',
+    fmActions: '操作',
+    fmUseInChannel: '用于渠道',
+    fmNoModels: '暂无免费模型，点击「刷新目录」获取。',
+    fmFetchFailed: '获取免费模型失败',
+    fmSource: '来源',
+    fmFetchedAt: '获取时间',
+    fmCached: '缓存',
+    fmFresh: '实时',
+    fmCount: '个模型',
   },
 };
 
@@ -588,7 +634,7 @@ function renderLogin() {
 }
 
 function renderSidebar() {
-  const navMap = { dashboard: 'dashboard', channels: 'channels', usage: 'usageMonitor', apikeys: 'apiKeys' };
+  const navMap = { dashboard: 'dashboard', channels: 'channels', usage: 'usageMonitor', apikeys: 'apiKeys', freemodels: 'freeModels' };
   document.querySelectorAll('#sidebar-nav .nav-item').forEach(el => {
     el.textContent = t(navMap[el.dataset.section]);
     el.classList.toggle('active', el.dataset.section === curSection);
@@ -615,9 +661,61 @@ function render() {
   renderDashboard();
   renderChannelHeaders();
   renderApiKeyHeaders();
+  renderFreeModelsHeaders();
   if (curSection === 'channels') renderChannels();
   if (curSection === 'usage') { renderUsageHeaders(); loadUsage(); }
   if (curSection === 'apikeys') renderApiKeys();
+  if (curSection === 'freemodels') { loadFreeModels(false); }
+}
+
+// ============ Free Models ============
+let freeModelsData = null;
+
+function renderFreeModelsHeaders() {
+  document.getElementById('fm-title').textContent = t('freeModels');
+  document.getElementById('fm-refresh-btn').textContent = t('fmRefresh');
+  document.getElementById('fm-thead').innerHTML = '<th>'+[t('fmModel'),t('fmName'),t('fmContext'),t('fmTools'),t('fmActions')].join('</th><th>')+'</th>';
+}
+
+async function loadFreeModels(force) {
+  const meta = document.getElementById('fm-meta');
+  const tb = document.getElementById('fm-tbody');
+  if (force) freeModelsData = null;
+  if (!freeModelsData) {
+    meta.textContent = '...';
+    tb.innerHTML = '<tr><td colspan="5" class="empty">...</td></tr>';
+    const r = force
+      ? await api('/freemodels/refresh', { method: 'POST' })
+      : await api('/freemodels');
+    if (!r || r.error || !Array.isArray(r.models)) {
+      meta.textContent = '';
+      tb.innerHTML = '<tr><td colspan="5" class="empty">' + (r?.error || t('fmFetchFailed')) + '</td></tr>';
+      return;
+    }
+    freeModelsData = r;
+  }
+  const d = freeModelsData;
+  meta.textContent = t('fmSource') + ': ' + (d.source || '-') + ' | ' + t('fmFetchedAt') + ': ' + (d.fetched_at || '-') + ' (' + (d.cached ? t('fmCached') : t('fmFresh')) + ') | ' + (d.count ?? d.models.length) + ' ' + t('fmCount');
+  if (!d.models.length) {
+    tb.innerHTML = '<tr><td colspan="5" class="empty">' + t('fmNoModels') + '</td></tr>';
+    return;
+  }
+  tb.innerHTML = d.models.map(m => \`
+    <tr>
+      <td><strong>\${esc(m.id)}</strong></td>
+      <td class="cell-truncate" title="\${esc(m.name)}">\${esc(m.name)}</td>
+      <td>\${m.context_length ?? '-'}</td>
+      <td>\${m.supported_parameters?.includes('tools') ? '<span class="badge badge-on">✓</span>' : '<span style="color:var(--text-2)">-</span>'}</td>
+      <td><button class="btn btn-sm btn-ghost" onclick="useFreeModel('\${esc(m.id)}')">\${t('fmUseInChannel')}</button></td>
+    </tr>
+  \`).join('');
+}
+
+function useFreeModel(modelId) {
+  navigate('channels');
+  showChModal();
+  const ta = document.getElementById('f-models');
+  if (ta) ta.value = modelId;
 }
 
 function renderChannelHeaders() {

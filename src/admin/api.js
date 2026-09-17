@@ -1,5 +1,6 @@
-export async function handleAdminApi(request, env, store) {
-  const url = new URL(request.url);
+import { getFreeModelsCatalog, refreshFreeModelsCatalog } from './freemodels.js';
+
+export async function handleAdminApi(request, env, store) {  const url = new URL(request.url);
   const path = url.pathname.replace('/admin/api', '');
   const method = request.method;
 
@@ -142,6 +143,16 @@ export async function handleAdminApi(request, env, store) {
       const date = url.searchParams.get('date') || new Date().toISOString().slice(0, 10);
       const rawUsage = await store.getApiKeyUsage(date);
       return jsonRes({ date, keys: rawUsage });
+    }
+
+    // --- Free Models Catalog (免费模型目录) ---
+    if (path === '/freemodels' && method === 'GET') {
+      const catalog = await getFreeModelsCatalog(env);
+      return jsonRes(catalog);
+    }
+    if (path === '/freemodels/refresh' && method === 'POST') {
+      const catalog = await refreshFreeModelsCatalog(env);
+      return jsonRes(catalog);
     }
 
     // --- Error Logs ---

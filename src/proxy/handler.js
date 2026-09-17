@@ -1,7 +1,7 @@
 import { verifyApiKey } from './auth.js';
 import { LoadBalancer } from '../lb/balancer.js';
 import { claudeToOpenAI, openAIToClaude, openAIStreamToClaudeStream } from './claude.js';
-import { responsesToChatCompletions, chatCompletionsToResponses, chatCompletionsStreamToResponsesStream } from './responses.js';
+import { responsesToChatCompletions, chatCompletionsToResponses, chatCompletionsStreamToResponsesStream, usesNativeResponses, observeResponsesStream } from './responses.js';
 
 export async function handleProxy(request, env, store) {
   // Verify client API key
@@ -212,11 +212,10 @@ async function handleResponses(request, url, body, store, allowedChannelIds, cli
   const model = body.model || '';
   const isStream = body.stream || false;
 
-  const openaiBody = responsesToChatCompletions(body);
-
-  if (isStream) {
-    openaiBody.stream_options = { include_usage: true };
+  if (!body || typeof body.model !== 'string' || !body.model.trim()) {
+    return responsesErrorRes('model is required', 400);
   }
+  let openaiBody;
 
   const lb = new LoadBalancer(store);
   const { targets, error } = await lb.selectTarget(model, allowedChannelIds);
@@ -239,7 +238,17 @@ async function handleResponses(request, url, body, store, allowedChannelIds, cli
     for (const target of targets) {
       try {
         const baseUrl = target.channel.base_url.replace(/\/+$/, '');
-        const targetUrl = baseUrl + '/chat/completions' + url.search;
+        const native = usesNativeResponses(target.channel);
+        if (!openaiBody) {
+          openaiBody = responsesToChatCompletions(body);
+          if (isStream) {
+            openaiBody.stream_options = { include_usage: true };
+          }
+        }
+        const isNative = native;
+        const targetUrl = isNative
+          ? baseUrl + '/responses' + url.search
+          : baseUrl + '/chat/completions' + url.search;
 
         console.log(`[proxy][responses] -> ${target.channel.name} ${targetUrl}${round > 0 ? ` (retry #${round})` : ''}`);
 
@@ -251,7 +260,7 @@ async function handleResponses(request, url, body, store, allowedChannelIds, cli
         const resp = await fetch(targetUrl, {
           method: 'POST',
           headers,
-          body: JSON.stringify(openaiBody),
+          body: isNative ? JSON.stringify(body) : JSON.stringify(openaiBody),
         });
         const rateHeaders = extractRateLimitHeaders(resp.headers);
         if (rateHeaders.hasAny) {
@@ -291,9 +300,11 @@ async function handleResponses(request, url, body, store, allowedChannelIds, cli
             store.incrementUsage(target.channel.id, target.key, model).catch(e =>
               console.error('[usage] increment failed:', e));
 
-            const { stream, usagePromise } = chatCompletionsStreamToResponsesStream(resp.body, model);
+            const observed = isNative
+              ? observeResponsesStream(resp.body)
+              : chatCompletionsStreamToResponsesStream(resp.body, model);
 
-            usagePromise.then(usage => {
+            observed.usagePromise.then(usage => {
               const pt = usage?.prompt_tokens || 0;
               const ct = usage?.completion_tokens || 0;
               store.incrementApiKeyUsage(clientKeyId, model, pt, ct).catch(e =>
@@ -302,7 +313,7 @@ async function handleResponses(request, url, body, store, allowedChannelIds, cli
               store.incrementApiKeyUsage(clientKeyId, model, 0, 0).catch(() => {});
             });
 
-            return new Response(stream, {
+            return new Response(observed.stream, {
               status: 200,
               headers: {
                 'Content-Type': 'text/event-stream',
@@ -312,6 +323,17 @@ async function handleResponses(request, url, body, store, allowedChannelIds, cli
                 'Access-Control-Allow-Origin': '*',
               },
             });
+          }
+
+          if (isNative) {
+            store.incrementUsage(target.channel.id, target.key, model).catch(e =>
+              console.error('[usage] increment failed:', e));
+            const usage = body.usage || {};
+            store.incrementApiKeyUsage(clientKeyId, model,
+              usage.input_tokens || 0, usage.output_tokens || 0).catch(e =>
+              console.error('[apikey-usage] increment failed:', e));
+            store.clearRateLimitCooldown(target.channel.id, target.key, model).catch(() => {});
+            return jsonRes(body, 200);
           }
 
           if (isStream) {
