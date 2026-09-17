@@ -225,6 +225,7 @@ export function chatCompletionsStreamToResponsesStream(upstreamBody, model) {
   const toolCalls = {};   // upstream tc.index -> { item, outputIdx }
   let nextOutputIdx = 0;
   let sequenceNumber = 0;
+  const outputItems = [];
 
   const responseObject = {
     id: responseId,
@@ -300,6 +301,7 @@ export function chatCompletionsStreamToResponsesStream(upstreamBody, model) {
               if (!messageItem) {
                 messageItem = { id: 'msg_' + rid(), type: 'message', role: 'assistant', status: 'in_progress', content: [] };
                 messageItemIdx = nextOutputIdx++;
+                outputItems[messageItemIdx] = messageItem;
                 send(ctrl, { type: 'response.output_item.added', output_index: messageItemIdx, item: messageItem, sequence_number: seq() });
               }
               if (!contentPartOpen) {
@@ -322,6 +324,7 @@ export function chatCompletionsStreamToResponsesStream(upstreamBody, model) {
                   const outputIdx = nextOutputIdx++;
                   const item = { type: 'function_call', id: 'fc_' + rid(), call_id: tc.id, name: tc.function.name, arguments: '', status: 'in_progress' };
                   toolCalls[tcIdx] = { item, outputIdx };
+                  outputItems[outputIdx] = item;
                   send(ctrl, { type: 'response.output_item.added', output_index: outputIdx, item, sequence_number: seq() });
                   if (tc.function.arguments) {
                     item.arguments += tc.function.arguments;
@@ -356,16 +359,10 @@ export function chatCompletionsStreamToResponsesStream(upstreamBody, model) {
         }
 
         // Collect all output items for the completed response
-        const allOutput = [];
-        if (messageItem) {
-          messageItem.status = 'completed';
-          allOutput.push(messageItem);
+        for (const item of outputItems) {
+          item.status = 'completed';
         }
-        for (const tcIdx of Object.keys(toolCalls).sort((a, b) => a - b)) {
-          toolCalls[tcIdx].item.status = 'completed';
-          allOutput.push(toolCalls[tcIdx].item);
-        }
-        responseObject.output = allOutput;
+        responseObject.output = outputItems;
         responseObject.status = 'completed';
 
         send(ctrl, { type: 'response.completed', response: responseObject, sequence_number: seq() });
