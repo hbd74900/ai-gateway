@@ -10,5 +10,8 @@
   },
   "devDependencies": {
     "wrangler": "^4.23.0"
+  },
+  "dependencies": {
+    "eventsource-parser": "^3.1.1"
   }
 }
