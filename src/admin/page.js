@@ -112,6 +112,29 @@ label{display:block;margin-bottom:6px;font-size:13px;color:var(--text-1);font-we
 .lang-btn{flex:1;padding:6px 0;text-align:center;font-size:12px;font-weight:500;color:var(--text-2);cursor:pointer;transition:all .15s;border:none;background:transparent}
 .lang-btn:hover{color:var(--text-0)}
 .lang-btn.active{background:var(--primary);color:#fff}
+
+/* Usage monitor */
+.usage-card{background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);padding:24px;margin-bottom:16px}
+.usage-card h4{font-size:16px;font-weight:600;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.usage-row{margin-bottom:14px}
+.usage-row:last-child{margin-bottom:0}
+.usage-label{display:flex;justify-content:space-between;margin-bottom:5px;font-size:13px;color:var(--text-1)}
+.usage-label .usage-val{font-weight:600;color:var(--text-0)}
+.progress-bar{height:8px;background:var(--bg-0);border-radius:4px;overflow:hidden}
+.progress-fill{height:100%;border-radius:4px;transition:width .4s ease}
+.progress-ok{background:linear-gradient(90deg,#22c55e,#4ade80)}
+.progress-warn{background:linear-gradient(90deg,#f59e0b,#fbbf24)}
+.progress-danger{background:linear-gradient(90deg,#ef4444,#f87171)}
+.date-picker{display:flex;gap:8px;align-items:center;margin-bottom:20px}
+.date-picker input[type="date"]{width:180px}
+
+/* 分页控件 */
+.pagination{display:flex;align-items:center;justify-content:center;gap:4px;margin-top:14px;padding-top:14px;border-top:1px solid var(--border)}
+.pagination button{min-width:32px;height:28px;border:1px solid var(--border);border-radius:4px;background:var(--bg-1);color:var(--text-1);font-size:12px;cursor:pointer;transition:all .15s;padding:0 8px}
+.pagination button:hover:not(:disabled):not(.pg-active){background:var(--bg-3);border-color:var(--primary)}
+.pagination button:disabled{opacity:.35;cursor:default}
+.pagination .pg-active{background:var(--primary);color:#fff;border-color:var(--primary);font-weight:600}
+.pagination .pg-info{font-size:12px;color:var(--text-2);margin:0 4px}
 </style>
 </head>
 <body>
@@ -140,6 +163,7 @@ label{display:block;margin-bottom:6px;font-size:13px;color:var(--text-1);font-we
     <nav class="sidebar-nav" id="sidebar-nav">
       <a class="nav-item active" data-section="dashboard" onclick="navigate('dashboard')"></a>
       <a class="nav-item" data-section="channels" onclick="navigate('channels')"></a>
+      <a class="nav-item" data-section="usage" onclick="navigate('usage')"></a>
       <a class="nav-item" data-section="apikeys" onclick="navigate('apikeys')"></a>
     </nav>
     <div class="sidebar-footer">
@@ -175,6 +199,23 @@ label{display:block;margin-bottom:6px;font-size:13px;color:var(--text-1);font-we
           <thead><tr id="ch-thead"></tr></thead>
           <tbody id="ch-tbody"></tbody>
         </table>
+      </div>
+    </section>
+
+    <!-- Usage Monitor -->
+    <section id="section-usage" class="section" style="display:none">
+      <div class="section-header">
+        <h2 id="usage-title"></h2>
+        <button class="btn btn-ghost" onclick="loadUsage()" id="usage-refresh-btn"></button>
+      </div>
+      <div class="date-picker">
+        <label id="usage-date-label" style="margin:0;white-space:nowrap"></label>
+        <input type="date" id="usage-date" onchange="loadUsage()">
+      </div>
+      <div id="usage-container"></div>
+      <div style="margin-top:32px">
+        <div class="section-header"><h2 id="error-title"></h2></div>
+        <div id="error-container"></div>
       </div>
     </section>
 
@@ -281,6 +322,51 @@ const I18N = {
     failed: 'Failed',
     copied: 'Copied!',
     copyFailed: 'Copy failed',
+    usageMonitor: 'Usage Monitor',
+    quotaSettings: 'Quota Settings',
+    enableQuota: 'Enable Quota',
+    dailyTotalLimit: 'Daily Total Limit',
+    dailyPerModelLimit: 'Daily Per-Model Limit',
+    quotaTotalHelp: 'Total requests per day. 0 = unlimited.',
+    quotaModelHelp: 'Max requests per model per day. 0 = unlimited.',
+    totalUsage: 'Daily Total',
+    perModelUsage: 'Per Model',
+    noQuotaChannels: 'No usage data for the selected date.',
+    quotaExceeded: 'Exceeded',
+    remaining: 'remaining',
+    unlimited: 'Unlimited',
+    usageDate: 'Date',
+    refreshUsage: 'Refresh',
+    quota: 'Quota',
+    quotaEnabled: 'Quota',
+    noQuota: 'No Quota',
+    noModelUsageYet: 'No requests yet',
+    requests: 'Requests',
+    tokens: 'Tokens',
+    estimatedCost: 'Cost',
+    promptTokens: 'Input',
+    completionTokens: 'Output',
+    usage: 'Usage',
+    noUsageYet: 'No usage yet',
+    boundChannels: 'Bound Channels',
+    allChannels: 'All Channels',
+    selectChannels: 'Select Channels',
+    channelBindHelp: 'Only route to selected channels. Empty = all channels.',
+    editKey: 'Edit Key',
+    errorLogs: 'Error Logs',
+    noErrors: 'No errors today.',
+    errorTime: 'Time',
+    errorModel: 'Model',
+    errorStatus: 'Status',
+    errorMessage: 'Message',
+    errorKey: 'Key',
+    errorsToday: 'errors today',
+    keysTotal: 'keys',
+    cooldown: 'Cooldown',
+    limitSource: 'Limit Source',
+    sourceUpstream: 'Upstream',
+    sourceChannel: 'Channel fallback',
+    sourceNone: 'None',
   },
   zh: {
     loginSub: '请输入管理员密码或 API Key 继续',
@@ -357,6 +443,51 @@ const I18N = {
     failed: '操作失败',
     copied: '已复制！',
     copyFailed: '复制失败',
+    usageMonitor: '用量监控',
+    quotaSettings: '配额设置',
+    enableQuota: '启用配额',
+    dailyTotalLimit: '每日总量限制',
+    dailyPerModelLimit: '每日单模型限制',
+    quotaTotalHelp: '每日请求总量上限，0 = 不限制。',
+    quotaModelHelp: '每个模型每日请求上限，0 = 不限制。',
+    totalUsage: '每日总量',
+    perModelUsage: '单模型用量',
+    noQuotaChannels: '所选日期暂无用量数据。',
+    quotaExceeded: '已超限',
+    remaining: '剩余',
+    unlimited: '不限制',
+    usageDate: '日期',
+    refreshUsage: '刷新',
+    quota: '配额',
+    quotaEnabled: '配额',
+    noQuota: '无配额',
+    noModelUsageYet: '暂无请求记录',
+    requests: '请求',
+    tokens: 'Tokens',
+    estimatedCost: '费用',
+    promptTokens: '输入',
+    completionTokens: '输出',
+    usage: '用量',
+    noUsageYet: '暂无用量',
+    boundChannels: '绑定渠道',
+    allChannels: '全部渠道',
+    selectChannels: '选择渠道',
+    channelBindHelp: '仅路由到选中的渠道。不选则使用全部渠道。',
+    editKey: '编辑密钥',
+    errorLogs: '错误日志',
+    noErrors: '今日暂无错误。',
+    errorTime: '时间',
+    errorModel: '模型',
+    errorStatus: '状态码',
+    errorMessage: '错误信息',
+    errorKey: '密钥',
+    errorsToday: '个错误',
+    keysTotal: '个密钥',
+    cooldown: '冷却倒计时',
+    limitSource: '限额来源',
+    sourceUpstream: '上游实时',
+    sourceChannel: '渠道兜底',
+    sourceNone: '无',
   },
 };
 
@@ -390,10 +521,17 @@ async function api(path, opts = {}) {
   }
 }
 
+let apiKeyUsage = {};
+
 async function loadData() {
-  const [ch, ak] = await Promise.all([api('/channels'), api('/apikeys')]);
+  const [ch, ak, aku] = await Promise.all([
+    api('/channels'),
+    api('/apikeys'),
+    api('/apikeys/usage'),
+  ]);
   channels = ch || [];
   apiKeys = ak || [];
+  apiKeyUsage = (aku && aku.keys) || {};
 }
 
 // ============ Auth ============
@@ -450,7 +588,7 @@ function renderLogin() {
 }
 
 function renderSidebar() {
-  const navMap = { dashboard: 'dashboard', channels: 'channels', apikeys: 'apiKeys' };
+  const navMap = { dashboard: 'dashboard', channels: 'channels', usage: 'usageMonitor', apikeys: 'apiKeys' };
   document.querySelectorAll('#sidebar-nav .nav-item').forEach(el => {
     el.textContent = t(navMap[el.dataset.section]);
     el.classList.toggle('active', el.dataset.section === curSection);
@@ -462,6 +600,7 @@ function renderSidebar() {
 }
 
 function navigate(section) {
+  if (section !== 'usage') syncUsageCooldownTicker(false);
   curSection = section;
   document.querySelectorAll('.nav-item').forEach(el => {
     el.classList.toggle('active', el.dataset.section === section);
@@ -477,19 +616,20 @@ function render() {
   renderChannelHeaders();
   renderApiKeyHeaders();
   if (curSection === 'channels') renderChannels();
+  if (curSection === 'usage') { renderUsageHeaders(); loadUsage(); }
   if (curSection === 'apikeys') renderApiKeys();
 }
 
 function renderChannelHeaders() {
   document.getElementById('ch-title').textContent = t('channels');
   document.getElementById('ch-add-btn').textContent = t('addChannel');
-  document.getElementById('ch-thead').innerHTML = '<th>'+[t('name'),t('baseUrl'),t('keys'),t('models'),t('priority'),t('weight'),t('status'),t('actions')].join('</th><th>')+'</th>';
+  document.getElementById('ch-thead').innerHTML = '<th>'+[t('name'),t('baseUrl'),t('keys'),t('models'),t('priority'),t('weight'),t('quota'),t('status'),t('actions')].join('</th><th>')+'</th>';
 }
 
 function renderApiKeyHeaders() {
   document.getElementById('ak-title').textContent = t('apiKeys');
   document.getElementById('ak-gen-btn').textContent = t('generateKey');
-  document.getElementById('ak-thead').innerHTML = '<th>'+[t('name'),t('key'),t('created'),t('status'),t('actions')].join('</th><th>')+'</th>';
+  document.getElementById('ak-thead').innerHTML = '<th>'+[t('name'),t('key'),t('boundChannels'),t('usage'),t('created'),t('status'),t('actions')].join('</th><th>')+'</th>';
 }
 
 // ============ Dashboard ============
@@ -521,7 +661,7 @@ function renderDashboard() {
 function renderChannels() {
   const tb = document.getElementById('ch-tbody');
   if (!channels.length) {
-    tb.innerHTML = '<tr><td colspan="8" class="empty">' + t('noChannels') + '</td></tr>';
+    tb.innerHTML = '<tr><td colspan="9" class="empty">' + t('noChannels') + '</td></tr>';
     return;
   }
   tb.innerHTML = channels.map(c => \`
@@ -532,6 +672,7 @@ function renderChannels() {
       <td>\${c.models?.length || '<span style="color:var(--text-2)">' + t('all') + '</span>'}</td>
       <td>\${c.priority}</td>
       <td>\${c.weight}</td>
+      <td>\${c.quota_enabled ? '<span class="badge badge-on">' + (c.quota_daily_total || '∞') + '/' + (c.quota_daily_per_model || '∞') + '</span>' : '<span style="color:var(--text-2)">-</span>'}</td>
       <td><span class="badge \${c.enabled ? 'badge-on' : 'badge-off'}">\${c.enabled ? t('on') : t('off')}</span></td>
       <td style="white-space:nowrap">
         <button class="btn btn-sm btn-ghost" onclick="showChModal('\${c.id}')">\${t('edit')}</button>
@@ -577,6 +718,24 @@ function showChModal(id) {
         <div class="form-help">\${t('weightHelp')}</div>
       </div>
     </div>
+    <div style="border-top:1px solid var(--border);margin:8px 0 16px;padding-top:16px">
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:12px">
+        <input type="checkbox" id="f-quota" \${ch?.quota_enabled ? 'checked' : ''} style="width:auto" onchange="document.getElementById('quota-fields').style.display=this.checked?'grid':'none'">
+        <span style="font-size:14px;font-weight:600">\${t('enableQuota')}</span>
+      </label>
+      <div class="form-row" id="quota-fields" style="display:\${ch?.quota_enabled ? 'grid' : 'none'}">
+        <div class="form-group">
+          <label>\${t('dailyTotalLimit')}</label>
+          <input type="number" id="f-qt" value="\${ch?.quota_daily_total || 2000}" min="0">
+          <div class="form-help">\${t('quotaTotalHelp')}</div>
+        </div>
+        <div class="form-group">
+          <label>\${t('dailyPerModelLimit')}</label>
+          <input type="number" id="f-qm" value="\${ch?.quota_daily_per_model || 500}" min="0">
+          <div class="form-help">\${t('quotaModelHelp')}</div>
+        </div>
+      </div>
+    </div>
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="closeModal()">\${t('cancel')}</button>
       <button class="btn btn-primary" onclick="saveCh('\${id||''}')">\${t('save')}</button>
@@ -593,9 +752,13 @@ async function saveCh(id) {
   const priority = parseInt(document.getElementById('f-pri').value) || 0;
   const weight = parseInt(document.getElementById('f-wt').value) || 1;
 
+  const quota_enabled = document.getElementById('f-quota').checked;
+  const quota_daily_total = parseInt(document.getElementById('f-qt').value) || 0;
+  const quota_daily_per_model = parseInt(document.getElementById('f-qm').value) || 0;
+
   if (!name || !base_url) { toast(t('nameUrlRequired'), 'error'); return; }
 
-  const body = JSON.stringify({ name, base_url, keys, models, priority, weight });
+  const body = JSON.stringify({ name, base_url, keys, models, priority, weight, quota_enabled, quota_daily_total, quota_daily_per_model });
   const r = id
     ? await api('/channels/' + id, { method: 'PUT', body })
     : await api('/channels', { method: 'POST', body });
@@ -619,23 +782,66 @@ async function toggleCh(id) {
 function renderApiKeys() {
   const tb = document.getElementById('ak-tbody');
   if (!apiKeys.length) {
-    tb.innerHTML = '<tr><td colspan="5" class="empty">' + t('noApiKeys') + '</td></tr>';
+    tb.innerHTML = '<tr><td colspan="7" class="empty">' + t('noApiKeys') + '</td></tr>';
     return;
   }
-  tb.innerHTML = apiKeys.map(k => \`
+  tb.innerHTML = apiKeys.map(k => {
+    const chIds = k.channel_ids || [];
+    const chNames = chIds.length > 0
+      ? chIds.map(id => { const ch = channels.find(c => c.id === id); return ch ? esc(ch.name) : '?'; }).join(', ')
+      : '<span style="color:var(--text-2)">' + t('allChannels') + '</span>';
+
+    // API 密钥用量统计
+    const u = apiKeyUsage[k.id];
+    let usageHtml;
+    if (u && u.requests > 0) {
+      const totalTokens = (u.prompt_tokens || 0) + (u.completion_tokens || 0);
+      const cost = calcKeyTotalCost(u);
+      usageHtml = '<div style="font-size:12px;line-height:1.6">' +
+        '<span style="color:var(--text-0)">' + fmtNum(u.requests) + '</span> <span style="color:var(--text-2)">' + t('requests') + '</span>' +
+        ' <span style="color:var(--border);margin:0 4px">·</span> ' +
+        '<span style="color:var(--text-0)">' + fmtNum(totalTokens) + '</span> <span style="color:var(--text-2)">' + t('tokens') + '</span>' +
+        (totalTokens > 0 ? ' <span style="font-size:11px;color:var(--text-2)">(' + fmtNum(u.prompt_tokens||0) + '↑ ' + fmtNum(u.completion_tokens||0) + '↓)</span>' : '') +
+        ' <span style="color:var(--border);margin:0 4px">·</span> ' +
+        '<span style="color:var(--success);font-weight:500">' + fmtCost(cost) + '</span>' +
+      '</div>';
+    } else {
+      usageHtml = '<span style="font-size:12px;color:var(--text-2)">' + t('noUsageYet') + '</span>';
+    }
+
+    return \`
     <tr>
       <td>\${esc(k.name)}</td>
       <td><span class="key-mono">\${maskKey(k.key)}</span>
         <button class="btn btn-sm btn-ghost" style="margin-left:8px" data-key="\${esc(k.key)}" onclick="copyKey(this)">\${t('copy')}</button>
       </td>
+      <td>\${chNames}</td>
+      <td>\${usageHtml}</td>
       <td>\${fmtDate(k.created_at)}</td>
       <td><span class="badge \${k.enabled?'badge-on':'badge-off'}">\${k.enabled?t('on'):t('off')}</span></td>
-      <td>
+      <td style="white-space:nowrap">
+        <button class="btn btn-sm btn-ghost" onclick="showEditAkModal('\${k.id}')">\${t('edit')}</button>
         <button class="btn btn-sm btn-ghost" onclick="toggleAk('\${k.id}')">\${k.enabled?t('disable'):t('enable')}</button>
         <button class="btn btn-sm btn-danger" onclick="confirmDel('apikey','\${k.id}','\${esc(k.name)}')">\${t('delete')}</button>
       </td>
     </tr>
-  \`).join('');
+  \`}).join('');
+}
+
+function channelCheckboxes(selectedIds) {
+  if (!channels.length) return '<div class="form-help">' + t('noChannels') + '</div>';
+  return channels.map(ch => {
+    const checked = selectedIds.includes(ch.id) ? 'checked' : '';
+    return '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:6px;font-size:14px">' +
+      '<input type="checkbox" class="ch-bind-cb" value="' + ch.id + '" ' + checked + ' style="width:auto">' +
+      '<span>' + esc(ch.name) + '</span>' +
+      '<span style="color:var(--text-2);font-size:12px;margin-left:auto">' + esc(ch.base_url) + '</span>' +
+    '</label>';
+  }).join('');
+}
+
+function getSelectedChannelIds() {
+  return Array.from(document.querySelectorAll('.ch-bind-cb:checked')).map(cb => cb.value);
 }
 
 function showAkModal() {
@@ -645,6 +851,13 @@ function showAkModal() {
       <label>\${t('nameOptional')}</label>
       <input id="f-akname" placeholder="\${t('nameOptPlaceholder')}">
     </div>
+    <div class="form-group">
+      <label>\${t('selectChannels')}</label>
+      <div style="background:var(--bg-0);border:1px solid var(--border);border-radius:6px;padding:12px;max-height:200px;overflow-y:auto">
+        \${channelCheckboxes([])}
+      </div>
+      <div class="form-help">\${t('channelBindHelp')}</div>
+    </div>
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="closeModal()">\${t('cancel')}</button>
       <button class="btn btn-primary" onclick="genAk()">\${t('generate')}</button>
@@ -652,9 +865,33 @@ function showAkModal() {
   \`);
 }
 
+function showEditAkModal(id) {
+  const k = apiKeys.find(x => x.id === id);
+  if (!k) return;
+  openModal(\`
+    <h3>\${t('editKey')}</h3>
+    <div class="form-group">
+      <label>\${t('name')}</label>
+      <input id="f-akname-edit" value="\${esc(k.name)}">
+    </div>
+    <div class="form-group">
+      <label>\${t('selectChannels')}</label>
+      <div style="background:var(--bg-0);border:1px solid var(--border);border-radius:6px;padding:12px;max-height:200px;overflow-y:auto">
+        \${channelCheckboxes(k.channel_ids || [])}
+      </div>
+      <div class="form-help">\${t('channelBindHelp')}</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">\${t('cancel')}</button>
+      <button class="btn btn-primary" onclick="saveEditAk('\${id}')">\${t('save')}</button>
+    </div>
+  \`);
+}
+
 async function genAk() {
   const name = document.getElementById('f-akname').value.trim() || 'Unnamed';
-  const r = await api('/apikeys', { method: 'POST', body: JSON.stringify({ name }) });
+  const channel_ids = getSelectedChannelIds();
+  const r = await api('/apikeys', { method: 'POST', body: JSON.stringify({ name, channel_ids }) });
   if (r && !r.error) {
     closeModal();
     openModal(\`
@@ -679,6 +916,268 @@ async function toggleAk(id) {
   if (!k) return;
   const r = await api('/apikeys/' + id, { method: 'PATCH', body: JSON.stringify({ enabled: !k.enabled }) });
   if (r && !r.error) { await loadData(); render(); }
+}
+
+async function saveEditAk(id) {
+  const name = document.getElementById('f-akname-edit').value.trim();
+  const channel_ids = getSelectedChannelIds();
+  const r = await api('/apikeys/' + id, { method: 'PATCH', body: JSON.stringify({ name, channel_ids }) });
+  if (r && !r.error) {
+    toast(t('channelUpdated'), 'success');
+    closeModal();
+    await loadData();
+    render();
+  } else {
+    toast(r?.error || t('failed'), 'error');
+  }
+}
+
+// ============ Usage Monitor ============
+let usageData = null;
+const USAGE_PAGE_SIZE = 10;
+const usageKeyPages = {};  // { channelId: currentPage(从1开始) }
+let usageCooldownTicker = null;
+
+function formatCooldownLeft(untilMs) {
+  const sec = Math.max(0, Math.ceil((untilMs - Date.now()) / 1000));
+  return sec + 's';
+}
+
+function syncUsageCooldownTicker(hasActiveCooldown) {
+  if (hasActiveCooldown) {
+    if (!usageCooldownTicker) {
+      usageCooldownTicker = setInterval(() => {
+        if (curSection !== 'usage' || !usageData) return;
+        renderUsage();
+      }, 1000);
+    }
+    return;
+  }
+  if (usageCooldownTicker) {
+    clearInterval(usageCooldownTicker);
+    usageCooldownTicker = null;
+  }
+}
+
+function renderUsageHeaders() {
+  document.getElementById('usage-title').textContent = t('usageMonitor');
+  document.getElementById('usage-refresh-btn').textContent = t('refreshUsage');
+  document.getElementById('usage-date-label').textContent = t('usageDate');
+  document.getElementById('error-title').textContent = t('errorLogs');
+  const dateInput = document.getElementById('usage-date');
+  if (!dateInput.value) {
+    dateInput.value = new Date().toISOString().slice(0, 10);
+  }
+}
+
+async function loadUsage() {
+  const date = document.getElementById('usage-date').value || new Date().toISOString().slice(0, 10);
+  const [data, errData] = await Promise.all([api('/usage?date=' + date), api('/errors?date=' + date)]);
+  if (data) { usageData = data; renderUsage(); }
+  renderErrors(errData);
+}
+
+function renderUsage() {
+  const container = document.getElementById('usage-container');
+  if (!usageData || !usageData.channels || usageData.channels.length === 0) {
+    container.innerHTML = '<div class="empty">' + t('noQuotaChannels') + '</div>';
+    syncUsageCooldownTicker(false);
+    return;
+  }
+
+  // 按有无用量排序：有用量的渠道排在前面
+  const sorted = [...usageData.channels].sort((a, b) => {
+    const aTotal = (a.keys || []).reduce((s, k) => s + (k.usage?.total || 0), 0);
+    const bTotal = (b.keys || []).reduce((s, k) => s + (k.usage?.total || 0), 0);
+    return bTotal - aTotal;
+  });
+
+  let hasAnyActiveCooldown = false;
+  container.innerHTML = sorted.map(ch => {
+    const statusDot = ch.enabled
+      ? '<span style="width:8px;height:8px;border-radius:50%;background:var(--success);display:inline-block"></span>'
+      : '<span style="width:8px;height:8px;border-radius:50%;background:var(--danger);display:inline-block"></span>';
+
+    // 配额徽章
+    const quotaBadge = ch.quota_enabled
+      ? '<span class="badge badge-on" style="font-size:11px;margin-left:8px">' + t('quotaEnabled') + '</span>'
+      : '<span class="badge" style="font-size:11px;margin-left:8px;background:rgba(113,113,122,.12);color:var(--text-2)">' + t('noQuota') + '</span>';
+
+    // 配额限制信息（渠道配置为本地兜底）
+    const limitInfo = '<span style="color:var(--text-2);font-size:13px;font-weight:400">' +
+      t('dailyTotalLimit') + ': ' + (ch.quota_enabled && ch.quota_daily_total > 0 ? ch.quota_daily_total : '∞') +
+      ' · ' + t('dailyPerModelLimit') + ': ' + (ch.quota_enabled && ch.quota_daily_per_model > 0 ? ch.quota_daily_per_model : '∞') +
+      '</span>';
+
+    const allKeys = ch.keys || [];
+    const totalKeys = allKeys.length;
+    const totalPages = Math.max(1, Math.ceil(totalKeys / USAGE_PAGE_SIZE));
+    const curPage = Math.min(usageKeyPages[ch.channel_id] || 1, totalPages);
+    usageKeyPages[ch.channel_id] = curPage;
+
+    const startIdx = (curPage - 1) * USAGE_PAGE_SIZE;
+    const pageKeys = allKeys.slice(startIdx, startIdx + USAGE_PAGE_SIZE);
+
+    const keyCards = pageKeys.map(k => {
+      const u = k.usage;
+      const limits = k.limits || {};
+      const rateState = k.rate_state || {};
+      const cooldowns = rateState.cooldowns || {};
+      const activeCooldownItems = Object.entries(cooldowns)
+        .filter(([, until]) => Number(until) > Date.now())
+        .sort((a, b) => Number(a[1]) - Number(b[1]));
+      if (activeCooldownItems.length > 0) hasAnyActiveCooldown = true;
+
+      const totalLimit = limits.total_limit || 0;
+      const hasTotalLimit = totalLimit > 0;
+      const totalSource = limits.total_source || 'none';
+      const sourceText = totalSource === 'upstream'
+        ? t('sourceUpstream')
+        : totalSource === 'channel'
+          ? t('sourceChannel')
+          : t('sourceNone');
+      const cooldownHtml = activeCooldownItems.length > 0
+        ? '<div style="margin:8px 0 12px 0;font-size:12px;color:#b45309;background:#fffbeb;border:1px solid #fcd34d;border-radius:6px;padding:8px">' +
+            '<div style="font-weight:600;margin-bottom:4px">' + t('cooldown') + '</div>' +
+            activeCooldownItems.map(([m, until]) => {
+              const modelTag = m === '*' ? 'all' : esc(m);
+              return '<div style="display:flex;justify-content:space-between;gap:8px">' +
+                '<span style="font-family:monospace">' + modelTag + '</span>' +
+                '<span>' + formatCooldownLeft(Number(until)) + '</span>' +
+              '</div>';
+            }).join('') +
+          '</div>'
+        : '';
+
+      // 总量显示
+      const totalPct = hasTotalLimit
+        ? Math.min(100, Math.round(u.total / totalLimit * 100))
+        : 0;
+      const totalClass = totalPct >= 90 ? 'progress-danger' : totalPct >= 70 ? 'progress-warn' : 'progress-ok';
+      const totalLabel = hasTotalLimit
+        ? u.total + ' / ' + totalLimit + '  (' + totalPct + '%)'
+        : String(u.total);
+
+      const modelNames = Object.keys(u.models || {}).sort();
+
+      const modelRows = modelNames.map(m => {
+        const count = u.models[m] || 0;
+        const upstreamLimit = limits.model_limits && Number.isFinite(limits.model_limits[m]) ? limits.model_limits[m] : 0;
+        const fallbackLimit = Number.isFinite(limits.default_model_limit) ? limits.default_model_limit : 0;
+        const modelLimit = upstreamLimit > 0 ? upstreamLimit : fallbackLimit;
+        const hasModelLimit = modelLimit > 0;
+        const pct = hasModelLimit
+          ? Math.min(100, Math.round(count / modelLimit * 100))
+          : 0;
+        const cls = pct >= 90 ? 'progress-danger' : pct >= 70 ? 'progress-warn' : 'progress-ok';
+        const lbl = hasModelLimit
+          ? count + ' / ' + modelLimit + '  (' + pct + '%)'
+          : String(count);
+        return '<div class="usage-row">' +
+          '<div class="usage-label"><span style="font-family:monospace;font-size:12px">' + esc(m) + '</span><span class="usage-val">' + lbl + '</span></div>' +
+          '<div class="progress-bar"><div class="progress-fill ' + cls + '" style="width:' + (hasModelLimit ? pct : Math.min(count / 5, 100)) + '%"></div></div>' +
+          '</div>';
+      }).join('');
+
+      return '<div style="background:var(--bg-1);border:1px solid var(--border);border-radius:6px;padding:16px;margin-bottom:10px">' +
+        '<div style="font-family:monospace;font-size:13px;color:var(--primary);margin-bottom:10px">' + esc(k.key_hint) + '</div>' +
+        '<div style="font-size:12px;color:var(--text-2);margin-bottom:8px">' + t('limitSource') + ': ' + sourceText + '</div>' +
+        cooldownHtml +
+        '<div class="usage-row">' +
+          '<div class="usage-label"><span>' + t('totalUsage') + '</span><span class="usage-val">' + totalLabel + '</span></div>' +
+          '<div class="progress-bar"><div class="progress-fill ' + totalClass + '" style="width:' + (hasTotalLimit ? totalPct : Math.min(u.total / 20, 100)) + '%"></div></div>' +
+        '</div>' +
+        (modelRows
+          ? '<div style="margin-top:12px"><div style="font-size:12px;color:var(--text-2);margin-bottom:8px;text-transform:uppercase;letter-spacing:.5px">' + t('perModelUsage') + '</div>' + modelRows + '</div>'
+          : '<div style="margin-top:8px;font-size:12px;color:var(--text-2)">' + t('noModelUsageYet') + '</div>') +
+      '</div>';
+    }).join('');
+
+    // 分页控件（仅在超过一页时显示）
+    let paginationHtml = '';
+    if (totalPages > 1) {
+      const cid = ch.channel_id;
+      const prevDisabled = curPage <= 1 ? ' disabled' : '';
+      const nextDisabled = curPage >= totalPages ? ' disabled' : '';
+
+      // 页码按钮（最多显示5个，当前页居中）
+      let pageStart = Math.max(1, curPage - 2);
+      let pageEnd = Math.min(totalPages, pageStart + 4);
+      if (pageEnd - pageStart < 4) pageStart = Math.max(1, pageEnd - 4);
+
+      let pageButtons = '';
+      for (let p = pageStart; p <= pageEnd; p++) {
+        const activeClass = p === curPage ? ' pg-active' : '';
+        pageButtons += '<button class="' + activeClass + '" onclick="window._usagePage(\\\'' + cid + '\\\',' + p + ')">' + p + '</button>';
+      }
+
+      paginationHtml = '<div class="pagination">' +
+        '<button' + prevDisabled + ' onclick="window._usagePage(\\\'' + cid + '\\\',' + (curPage - 1) + ')">&laquo;</button>' +
+        pageButtons +
+        '<button' + nextDisabled + ' onclick="window._usagePage(\\\'' + cid + '\\\',' + (curPage + 1) + ')">&raquo;</button>' +
+        '<span class="pg-info">' + totalKeys + ' ' + t('keysTotal') + '</span>' +
+      '</div>';
+    }
+
+    return '<div class="usage-card">' +
+      '<h4>' + statusDot + ' ' + esc(ch.channel_name) + quotaBadge + '</h4>' +
+      (limitInfo ? '<div style="margin-bottom:14px">' + limitInfo + '</div>' : '') +
+      keyCards +
+      paginationHtml +
+    '</div>';
+  }).join('');
+  syncUsageCooldownTicker(hasAnyActiveCooldown);
+}
+
+// 分页跳转
+window._usagePage = function(channelId, page) {
+  usageKeyPages[channelId] = page;
+  renderUsage();
+};
+
+function renderErrors(errData) {
+  const container = document.getElementById('error-container');
+  if (!errData || !errData.channels || errData.channels.length === 0) {
+    container.innerHTML = '<div class="empty">' + t('noErrors') + '</div>';
+    return;
+  }
+  container.innerHTML = errData.channels.map(ch => {
+    const errors = (ch.errors || []).slice().reverse();
+    const rows = errors.map(e => {
+      const time = e.time ? new Date(e.time).toLocaleTimeString() : '-';
+      const statusBadge = e.status >= 500
+        ? '<span class="badge badge-off">' + e.status + '</span>'
+        : e.status === 404
+          ? '<span class="badge" style="background:rgba(245,158,11,.12);color:var(--warning)">' + e.status + '</span>'
+          : e.status > 0
+            ? '<span class="badge" style="background:rgba(99,102,241,.12);color:var(--primary)">' + e.status + '</span>'
+            : '<span class="badge badge-off">ERR</span>';
+      return '<tr>' +
+        '<td style="white-space:nowrap;font-size:13px;color:var(--text-2)">' + time + '</td>' +
+        '<td style="font-family:monospace;font-size:13px">' + esc(e.model || '-') + '</td>' +
+        '<td>' + statusBadge + '</td>' +
+        '<td class="cell-truncate" title="' + esc(e.message) + '" style="font-size:13px">' + esc(e.message) + '</td>' +
+        '<td style="font-family:monospace;font-size:12px;color:var(--text-2)">' + esc(e.key_hint || '-') + '</td>' +
+      '</tr>';
+    }).join('');
+
+    return '<div class="usage-card">' +
+      '<h4 style="display:flex;align-items:center;gap:8px">' +
+        '<span style="width:8px;height:8px;border-radius:50%;background:var(--danger);display:inline-block"></span> ' +
+        esc(ch.channel_name) +
+        ' <span style="color:var(--text-2);font-size:13px;font-weight:400">' + errors.length + ' ' + t('errorsToday') + '</span>' +
+      '</h4>' +
+      '<div class="table-container" style="margin-top:12px">' +
+        '<table><thead><tr>' +
+          '<th>' + t('errorTime') + '</th>' +
+          '<th>' + t('errorModel') + '</th>' +
+          '<th>' + t('errorStatus') + '</th>' +
+          '<th>' + t('errorMessage') + '</th>' +
+          '<th>' + t('errorKey') + '</th>' +
+        '</tr></thead><tbody>' + rows + '</tbody></table>' +
+      '</div>' +
+    '</div>';
+  }).join('');
 }
 
 // ============ Shared ============
@@ -731,6 +1230,35 @@ function esc(s) {
 }
 function maskKey(k) { return k && k.length > 12 ? k.slice(0,7) + '...' + k.slice(-4) : k; }
 function fmtDate(d) { return d ? new Date(d).toLocaleDateString() : '-'; }
+function fmtNum(n) { return n >= 1000000 ? (n / 1000000).toFixed(1) + 'M' : n >= 1000 ? (n / 1000).toFixed(1) + 'K' : String(n); }
+function fmtCost(n) { return n >= 0.01 ? '$' + n.toFixed(2) : n > 0 ? '$' + n.toFixed(4) : '$0'; }
+
+// 模型定价（每百万 token 美元）
+const MODEL_PRICING = {
+  'gpt-4o':{i:2.5,o:10},'gpt-4o-mini':{i:.15,o:.6},'gpt-4-turbo':{i:10,o:30},'gpt-4':{i:30,o:60},
+  'gpt-3.5-turbo':{i:.5,o:1.5},'o1':{i:15,o:60},'o1-mini':{i:3,o:12},'o3-mini':{i:1.1,o:4.4},
+  'claude-opus-4':{i:15,o:75},'claude-sonnet-4':{i:3,o:15},'claude-3-7-sonnet':{i:3,o:15},
+  'claude-3-5-sonnet':{i:3,o:15},'claude-3-5-haiku':{i:.8,o:4},'claude-3-opus':{i:15,o:75},
+  'claude-3-sonnet':{i:3,o:15},'claude-3-haiku':{i:.25,o:1.25},
+  'deepseek-chat':{i:.14,o:.28},'deepseek-reasoner':{i:.55,o:2.19},
+  'gemini-2.0-flash':{i:.1,o:.4},'gemini-2.0-pro':{i:1.25,o:10},'gemini-1.5-pro':{i:1.25,o:5},'gemini-1.5-flash':{i:.075,o:.3},
+  'glm-4':{i:1,o:1},'glm-4-flash':{i:.01,o:.01},'glm-4-plus':{i:.5,o:.5},
+  'qwen-turbo':{i:.3,o:.6},'qwen-plus':{i:.8,o:2},'qwen-max':{i:2,o:6},
+};
+function calcCost(model, pt, ct) {
+  let p = MODEL_PRICING[model];
+  if (!p) { for (const [k,v] of Object.entries(MODEL_PRICING)) { if (model && model.startsWith(k)) { p = v; break; } } }
+  if (!p) return 0;
+  return (pt * p.i + ct * p.o) / 1e6;
+}
+function calcKeyTotalCost(usage) {
+  if (!usage || !usage.models) return 0;
+  let total = 0;
+  for (const [m, d] of Object.entries(usage.models)) {
+    total += calcCost(m, d.prompt_tokens || 0, d.completion_tokens || 0);
+  }
+  return total;
+}
 function copyKey(btn) { copyText(btn.dataset.key); }
 async function copyText(txt) {
   try { await navigator.clipboard.writeText(txt); toast(t('copied'), 'success'); }

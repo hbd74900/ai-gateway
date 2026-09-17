@@ -24,6 +24,9 @@ export async function handleAdminApi(request, env, store) {
         enabled: data.enabled !== false,
         priority: parseInt(data.priority) || 0,
         weight: Math.max(1, parseInt(data.weight) || 1),
+        quota_enabled: !!data.quota_enabled,
+        quota_daily_total: Math.max(0, parseInt(data.quota_daily_total) || 0),
+        quota_daily_per_model: Math.max(0, parseInt(data.quota_daily_per_model) || 0),
         created_at: new Date().toISOString(),
       };
       channels.push(channel);
@@ -52,9 +55,13 @@ export async function handleAdminApi(request, env, store) {
           enabled: data.enabled ?? ch.enabled,
           priority: data.priority !== undefined ? (parseInt(data.priority) || 0) : ch.priority,
           weight: data.weight !== undefined ? Math.max(1, parseInt(data.weight) || 1) : ch.weight,
-          id, // preserve id
+          quota_enabled: data.quota_enabled !== undefined ? !!data.quota_enabled : (ch.quota_enabled || false),
+          quota_daily_total: data.quota_daily_total !== undefined ? Math.max(0, parseInt(data.quota_daily_total) || 0) : (ch.quota_daily_total || 0),
+          quota_daily_per_model: data.quota_daily_per_model !== undefined ? Math.max(0, parseInt(data.quota_daily_per_model) || 0) : (ch.quota_daily_per_model || 0),
+          id,
         };
         await store.saveChannels(channels);
+        store.invalidateModelCache(id);
         return jsonRes(channels[idx]);
       }
 
@@ -63,6 +70,7 @@ export async function handleAdminApi(request, env, store) {
         const filtered = channels.filter(ch => ch.id !== id);
         if (filtered.length === channels.length) return jsonRes({ error: 'Channel not found' }, 404);
         await store.saveChannels(filtered);
+        store.invalidateModelCache(id);
         return jsonRes({ success: true });
       }
     }
@@ -79,6 +87,77 @@ export async function handleAdminApi(request, env, store) {
       return jsonRes(channels[idx]);
     }
 
+    // --- Usage (所有渠道，不再限制仅 quota_enabled) ---
+    if (path === '/usage' && method === 'GET') {
+      const date = url.searchParams.get('date') || new Date().toISOString().slice(0, 10);
+      const channels = await store.getChannels();
+      const usageData = await Promise.all(
+        channels.map(async ch => {
+          const rawUsage = await store.getUsage(ch.id, date);
+          const rawRate = await store.getRateLimits(ch.id, date);
+          const keys = (ch.keys || []).map(k => {
+            const kid = k.slice(-8);
+            const usage = rawUsage[kid] || { total: 0, models: {} };
+            const rateInfo = store.getRateLimitInfoWithData(k, rawRate);
+            const upstreamTotalLimit = Number.isFinite(rateInfo?.header?.user_limit) ? rateInfo.header.user_limit : 0;
+            const upstreamModelLimits = {};
+            for (const [m, d] of Object.entries(rateInfo?.header?.model_limits || {})) {
+              if (Number.isFinite(d?.limit) && d.limit > 0) upstreamModelLimits[m] = d.limit;
+            }
+            const fallbackTotalLimit = ch.quota_enabled ? (ch.quota_daily_total || 0) : 0;
+            const fallbackModelLimit = ch.quota_enabled ? (ch.quota_daily_per_model || 0) : 0;
+            return {
+              key_id: kid,
+              key_hint: k.length > 12 ? k.slice(0, 7) + '...' + k.slice(-4) : k,
+              usage,
+              limits: {
+                total_limit: upstreamTotalLimit > 0 ? upstreamTotalLimit : fallbackTotalLimit,
+                total_source: upstreamTotalLimit > 0 ? 'upstream' : (fallbackTotalLimit > 0 ? 'channel' : 'none'),
+                default_model_limit: fallbackModelLimit,
+                model_limits: upstreamModelLimits,
+                model_source: Object.keys(upstreamModelLimits).length > 0 ? 'upstream' : (fallbackModelLimit > 0 ? 'channel' : 'none'),
+              },
+              rate_state: {
+                daily_models: rateInfo?.daily_models || [],
+                cooldowns: rateInfo?.cooldowns || {},
+              },
+            };
+          });
+          return {
+            channel_id: ch.id,
+            channel_name: ch.name,
+            enabled: ch.enabled,
+            quota_enabled: !!ch.quota_enabled,
+            quota_daily_total: ch.quota_daily_total || 0,
+            quota_daily_per_model: ch.quota_daily_per_model || 0,
+            keys,
+          };
+        })
+      );
+      return jsonRes({ date, channels: usageData });
+    }
+
+    // --- API Key Usage (客户端密钥用量统计) ---
+    if (path === '/apikeys/usage' && method === 'GET') {
+      const date = url.searchParams.get('date') || new Date().toISOString().slice(0, 10);
+      const rawUsage = await store.getApiKeyUsage(date);
+      return jsonRes({ date, keys: rawUsage });
+    }
+
+    // --- Error Logs ---
+    if (path === '/errors' && method === 'GET') {
+      const date = url.searchParams.get('date') || new Date().toISOString().slice(0, 10);
+      const channels = await store.getChannels();
+      const errorData = await Promise.all(
+        channels.map(async ch => ({
+          channel_id: ch.id,
+          channel_name: ch.name,
+          errors: await store.getErrors(ch.id, date),
+        }))
+      );
+      return jsonRes({ date, channels: errorData.filter(d => d.errors.length > 0) });
+    }
+
     // --- API Keys ---
     if (path === '/apikeys' && method === 'GET') {
       return jsonRes(await store.getApiKeys());
@@ -91,6 +170,7 @@ export async function handleAdminApi(request, env, store) {
         id: crypto.randomUUID(),
         name: data.name?.trim() || 'Unnamed',
         key: generateApiKeyString(),
+        channel_ids: Array.isArray(data.channel_ids) ? data.channel_ids.filter(Boolean) : [],
         enabled: true,
         created_at: new Date().toISOString(),
       };
@@ -119,9 +199,79 @@ export async function handleAdminApi(request, env, store) {
         if (idx === -1) return jsonRes({ error: 'API key not found' }, 404);
         if (data.enabled !== undefined) keys[idx].enabled = data.enabled;
         if (data.name !== undefined) keys[idx].name = data.name.trim();
+        if (data.channel_ids !== undefined) keys[idx].channel_ids = Array.isArray(data.channel_ids) ? data.channel_ids.filter(Boolean) : [];
         await store.saveApiKeys(keys);
         return jsonRes(keys[idx]);
       }
+    }
+
+    // --- Test Upstream Connectivity (diagnostic) ---
+    if (path === '/test-upstream' && method === 'POST') {
+      const data = await request.json();
+      const channels = await store.getChannels();
+      const channelId = data.channel_id;
+      const model = data.model || '';
+
+      const testChannels = channelId
+        ? channels.filter(ch => ch.id === channelId)
+        : channels.filter(ch => ch.enabled && ch.keys?.length > 0);
+
+      if (testChannels.length === 0) {
+        return jsonRes({ error: 'No matching channels found' }, 404);
+      }
+
+      const results = [];
+      for (const ch of testChannels) {
+        for (const key of (ch.keys || [])) {
+          const keyHint = key.length > 12 ? key.slice(0, 7) + '...' + key.slice(-4) : key;
+          const baseUrl = ch.base_url.replace(/\/+$/, '');
+          const testUrl = baseUrl + '/chat/completions';
+          const start = Date.now();
+          try {
+            const resp = await fetch(testUrl, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${key}`,
+              },
+              body: JSON.stringify({
+                model: model || 'gpt-3.5-turbo',
+                messages: [{ role: 'user', content: 'say ok' }],
+                max_tokens: 3,
+              }),
+            });
+            const duration = Date.now() - start;
+            const rateHeaders = {};
+            for (const h of ['modelscope-ratelimit-requests-limit', 'modelscope-ratelimit-requests-remaining',
+              'modelscope-ratelimit-model-requests-limit', 'modelscope-ratelimit-model-requests-remaining',
+              'retry-after', 'x-ratelimit-limit-requests', 'x-ratelimit-remaining-requests']) {
+              const v = resp.headers.get(h);
+              if (v != null) rateHeaders[h] = v;
+            }
+            let body = '';
+            try { body = (await resp.text()).slice(0, 300); } catch {}
+            results.push({
+              channel: ch.name, channel_id: ch.id, key_hint: keyHint,
+              status: resp.status, duration_ms: duration,
+              rate_headers: rateHeaders, body,
+            });
+          } catch (err) {
+            results.push({
+              channel: ch.name, channel_id: ch.id, key_hint: keyHint,
+              status: 0, duration_ms: Date.now() - start,
+              error: err.message,
+            });
+          }
+          await new Promise(r => setTimeout(r, 1000));
+        }
+      }
+
+      const count429 = results.filter(r => r.status === 429).length;
+      const count200 = results.filter(r => r.status === 200).length;
+      return jsonRes({
+        summary: { total: results.length, ok: count200, rate_limited: count429 },
+        results,
+      });
     }
 
     return jsonRes({ error: 'Not found' }, 404);

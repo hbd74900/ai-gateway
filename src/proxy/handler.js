@@ -1,6 +1,7 @@
 import { verifyApiKey } from './auth.js';
 import { LoadBalancer } from '../lb/balancer.js';
 import { claudeToOpenAI, openAIToClaude, openAIStreamToClaudeStream } from './claude.js';
+import { responsesToChatCompletions, chatCompletionsToResponses, chatCompletionsStreamToResponsesStream } from './responses.js';
 
 export async function handleProxy(request, env, store) {
   // Verify client API key
@@ -14,9 +15,12 @@ export async function handleProxy(request, env, store) {
   const url = new URL(request.url);
   const path = url.pathname;
 
+  const allowedChannelIds = authResult.apiKey.channel_ids || null;
+  const clientKeyId = authResult.apiKey.id;
+
   // GET /v1/models
   if (path.endsWith('/models') && request.method === 'GET') {
-    return handleModels(store);
+    return handleModels(store, allowedChannelIds);
   }
 
   // Only POST for completions / embeddings / messages
@@ -33,94 +37,327 @@ export async function handleProxy(request, env, store) {
 
   // ---- Claude Messages API (/v1/messages) ----
   if (path.endsWith('/messages')) {
-    return handleClaudeMessages(request, url, body, store);
+    return handleClaudeMessages(request, url, body, store, allowedChannelIds, clientKeyId);
+  }
+
+  // ---- OpenAI Responses API (/v1/responses) ----
+  if (path.endsWith('/responses')) {
+    return handleResponses(request, url, body, store, allowedChannelIds, clientKeyId);
   }
 
   // ---- OpenAI-compatible passthrough ----
-  return handleOpenAIProxy(request, url, path, body, store);
+  return handleOpenAIProxy(request, url, path, body, store, allowedChannelIds, clientKeyId);
 }
 
 // ─── Claude Messages API handler ───────────────────────────────────
 
-async function handleClaudeMessages(request, url, claudeBody, store) {
+async function handleClaudeMessages(request, url, claudeBody, store, allowedChannelIds, clientKeyId) {
   const model = claudeBody.model || '';
   const isStream = claudeBody.stream || false;
 
   // Convert Claude request to OpenAI format
   const openaiBody = claudeToOpenAI(claudeBody);
 
+  // 参考 one-api：流式请求注入 stream_options，让上游返回 token 用量
+  if (isStream) {
+    openaiBody.stream_options = { include_usage: true };
+  }
+
   const lb = new LoadBalancer(store);
-  const { targets, error } = await lb.selectTarget(model);
+  const { targets, error } = await lb.selectTarget(model, allowedChannelIds);
 
   if (error || targets.length === 0) {
     // Return error in Claude format
     return claudeErrorRes(error || 'No available channel for model: ' + model, 503);
   }
 
+  const MAX_429_ROUNDS = 2;
   let lastError = null;
-  for (const target of targets) {
-    try {
-      const baseUrl = target.channel.base_url.replace(/\/+$/, '');
-      const targetUrl = baseUrl + '/chat/completions' + url.search;
+  let last429Body = '';
 
-      console.log(`[proxy][claude] -> ${target.channel.name} ${targetUrl}`);
-
-      const headers = new Headers();
-      headers.set('Content-Type', 'application/json');
-      headers.set('Authorization', `Bearer ${target.key}`);
-      if (isStream) headers.set('Accept', 'text/event-stream');
-
-      const resp = await fetch(targetUrl, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(openaiBody),
-      });
-
-      if (resp.ok || resp.status < 500) {
-        if (!resp.ok) {
-          // 4xx from upstream — forward as Claude-shaped error
-          const errBody = await resp.text();
-          return claudeErrorRes(`Upstream error: ${errBody}`, resp.status);
-        }
-
-        // ---- Streaming ----
-        if (isStream) {
-          const claudeStream = openAIStreamToClaudeStream(resp.body, model);
-          return new Response(claudeStream, {
-            status: 200,
-            headers: {
-              'Content-Type': 'text/event-stream',
-              'Cache-Control': 'no-cache',
-              'Connection': 'keep-alive',
-              'Access-Control-Allow-Origin': '*',
-            },
-          });
-        }
-
-        // ---- Non-streaming ----
-        const openaiData = await resp.json();
-        const claudeResponse = openAIToClaude(openaiData, model);
-        return jsonRes(claudeResponse, 200);
-      }
-
-      // 5xx — try next target
-      lastError = `${target.channel.name}: HTTP ${resp.status}`;
-      console.error(`[proxy][claude] target failed: ${lastError}`);
-    } catch (err) {
-      lastError = `${target.channel.name}: ${err.message}`;
-      console.error(`[proxy][claude] target error: ${lastError}`);
+  for (let round = 0; round < MAX_429_ROUNDS; round++) {
+    if (round > 0) {
+      console.log(`[proxy][claude] all targets returned 429, retry round ${round + 1} after delay`);
+      await sleep(3000 * round);
     }
+    let consecutive429 = 0;
+
+    for (const target of targets) {
+      try {
+        const baseUrl = target.channel.base_url.replace(/\/+$/, '');
+        const targetUrl = baseUrl + '/chat/completions' + url.search;
+
+        console.log(`[proxy][claude] -> ${target.channel.name} ${targetUrl}${round > 0 ? ` (retry #${round})` : ''}`);
+
+        const headers = new Headers();
+        headers.set('Content-Type', 'application/json');
+        headers.set('Authorization', `Bearer ${target.key}`);
+        if (isStream) headers.set('Accept', 'text/event-stream');
+
+        const resp = await fetch(targetUrl, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(openaiBody),
+        });
+        const rateHeaders = extractRateLimitHeaders(resp.headers);
+        if (rateHeaders.hasAny) {
+          store.updateRateLimitHeaders(target.channel.id, target.key, model, rateHeaders).catch(e =>
+            console.error('[ratelimit] update headers failed:', e)
+          );
+        }
+
+        if (resp.status === 404) {
+          lastError = `HTTP 404 (model not found)`;
+          logError(store, target, model, 404, lastError);
+          continue;
+        }
+
+        if (resp.status === 429) {
+          consecutive429++;
+          try { last429Body = await resp.text(); } catch { last429Body = ''; }
+          lastError = `HTTP 429 (rate limited)`;
+          const rlReason = await classifyAndRecord429(store, target, model, resp, rateHeaders);
+          logError(store, target, model, 429, `${lastError}${rlReason ? `: ${rlReason}` : ''}`);
+          await sleep(calc429Delay(rateHeaders, consecutive429));
+          continue;
+        }
+
+        if (resp.ok || resp.status < 500) {
+          if (!resp.ok) {
+            const errBody = await resp.text();
+            logError(store, target, model, resp.status, errBody);
+            return claudeErrorRes(`Upstream error: ${errBody}`, resp.status);
+          }
+
+          // 上游返回 SSE 流时才走流式处理；某些上游在异常情况下即使收到
+          // stream:true 也会返回普通 JSON（choices:null），此时走非流式验证路径
+          const upstreamIsSSE = isStream &&
+            (resp.headers.get('Content-Type') || '').includes('text/event-stream');
+
+          if (upstreamIsSSE) {
+            store.clearRateLimitCooldown(target.channel.id, target.key, model).catch(() => {});
+            // 渠道用量立即记录（仅计数）
+            store.incrementUsage(target.channel.id, target.key, model).catch(e =>
+              console.error('[usage] increment failed:', e));
+
+            // 参考 one-api：先通过 processStream 捕获流式 usage，再转换为 Claude 格式
+            const { stream: processedStream, usagePromise } = processStream(resp.body);
+            const claudeStream = openAIStreamToClaudeStream(processedStream, model);
+
+            // 流结束后异步记录 API 密钥用量（含 token 数）
+            usagePromise.then(usage => {
+              const pt = usage?.prompt_tokens || 0;
+              const ct = usage?.completion_tokens || 0;
+              store.incrementApiKeyUsage(clientKeyId, model, pt, ct).catch(e =>
+                console.error('[apikey-usage] increment failed:', e));
+            }).catch(() => {
+              store.incrementApiKeyUsage(clientKeyId, model, 0, 0).catch(() => {});
+            });
+
+            return new Response(claudeStream, {
+              status: 200,
+              headers: {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                // 禁用 nginx 缓冲，确保 HF Spaces 代理实时转发流式数据
+                'X-Accel-Buffering': 'no',
+                'Access-Control-Allow-Origin': '*',
+              },
+            });
+          }
+
+          // 非流式 或 上游未返回 SSE 时（可能是异常 JSON），验证 choices 字段
+          if (isStream) {
+            console.warn(`[proxy][claude] 上游对 stream:true 返回了非 SSE 响应 (Content-Type: ${resp.headers.get('Content-Type')}), 回退到非流式验证`);
+          }
+          const openaiData = await resp.json();
+          if (!Array.isArray(openaiData.choices)) {
+            lastError = `upstream returned invalid response (choices=${openaiData.choices})`;
+            logError(store, target, model, 200, lastError);
+            continue;
+          }
+
+          // 非流式：从响应中提取 token 用量
+          const pt = openaiData.usage?.prompt_tokens || 0;
+          const ct = openaiData.usage?.completion_tokens || 0;
+          store.incrementUsage(target.channel.id, target.key, model).catch(e =>
+            console.error('[usage] increment failed:', e));
+          store.incrementApiKeyUsage(clientKeyId, model, pt, ct).catch(e =>
+            console.error('[apikey-usage] increment failed:', e));
+
+          const claudeResponse = openAIToClaude(openaiData, model);
+          store.clearRateLimitCooldown(target.channel.id, target.key, model).catch(() => {});
+          return jsonRes(claudeResponse, 200);
+        }
+
+        lastError = `HTTP ${resp.status}`;
+        logError(store, target, model, resp.status, lastError);
+      } catch (err) {
+        lastError = err.message;
+        logError(store, target, model, 0, lastError);
+      }
+    }
+
+    if (consecutive429 === 0 || consecutive429 < targets.length) break;
   }
 
-  return claudeErrorRes(`All targets failed. Last error: ${lastError}`, 502);
+  const detail = last429Body ? ` | upstream: ${last429Body.slice(0, 200)}` : '';
+  return claudeErrorRes(`All targets failed. Last error: ${lastError}${detail}`, 502);
+}
+
+// ─── OpenAI Responses API handler ──────────────────────────────────
+
+async function handleResponses(request, url, body, store, allowedChannelIds, clientKeyId) {
+  const model = body.model || '';
+  const isStream = body.stream || false;
+
+  const openaiBody = responsesToChatCompletions(body);
+
+  if (isStream) {
+    openaiBody.stream_options = { include_usage: true };
+  }
+
+  const lb = new LoadBalancer(store);
+  const { targets, error } = await lb.selectTarget(model, allowedChannelIds);
+
+  if (error || targets.length === 0) {
+    return responsesErrorRes(error || 'No available channel for model: ' + model, 503);
+  }
+
+  const MAX_429_ROUNDS = 2;
+  let lastError = null;
+  let last429Body = '';
+
+  for (let round = 0; round < MAX_429_ROUNDS; round++) {
+    if (round > 0) {
+      console.log(`[proxy][responses] all targets returned 429, retry round ${round + 1} after delay`);
+      await sleep(3000 * round);
+    }
+    let consecutive429 = 0;
+
+    for (const target of targets) {
+      try {
+        const baseUrl = target.channel.base_url.replace(/\/+$/, '');
+        const targetUrl = baseUrl + '/chat/completions' + url.search;
+
+        console.log(`[proxy][responses] -> ${target.channel.name} ${targetUrl}${round > 0 ? ` (retry #${round})` : ''}`);
+
+        const headers = new Headers();
+        headers.set('Content-Type', 'application/json');
+        headers.set('Authorization', `Bearer ${target.key}`);
+        if (isStream) headers.set('Accept', 'text/event-stream');
+
+        const resp = await fetch(targetUrl, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(openaiBody),
+        });
+        const rateHeaders = extractRateLimitHeaders(resp.headers);
+        if (rateHeaders.hasAny) {
+          store.updateRateLimitHeaders(target.channel.id, target.key, model, rateHeaders).catch(e =>
+            console.error('[ratelimit] update headers failed:', e)
+          );
+        }
+
+        if (resp.status === 404) {
+          lastError = `HTTP 404 (model not found)`;
+          logError(store, target, model, 404, lastError);
+          continue;
+        }
+
+        if (resp.status === 429) {
+          consecutive429++;
+          try { last429Body = await resp.text(); } catch { last429Body = ''; }
+          lastError = `HTTP 429 (rate limited)`;
+          const rlReason = await classifyAndRecord429(store, target, model, resp, rateHeaders);
+          logError(store, target, model, 429, `${lastError}${rlReason ? `: ${rlReason}` : ''}`);
+          await sleep(calc429Delay(rateHeaders, consecutive429));
+          continue;
+        }
+
+        if (resp.ok || resp.status < 500) {
+          if (!resp.ok) {
+            const errBody = await resp.text();
+            logError(store, target, model, resp.status, errBody);
+            return responsesErrorRes(`Upstream error: ${errBody}`, resp.status);
+          }
+
+          const upstreamIsSSE = isStream &&
+            (resp.headers.get('Content-Type') || '').includes('text/event-stream');
+
+          if (upstreamIsSSE) {
+            store.clearRateLimitCooldown(target.channel.id, target.key, model).catch(() => {});
+            store.incrementUsage(target.channel.id, target.key, model).catch(e =>
+              console.error('[usage] increment failed:', e));
+
+            const { stream, usagePromise } = chatCompletionsStreamToResponsesStream(resp.body, model);
+
+            usagePromise.then(usage => {
+              const pt = usage?.prompt_tokens || 0;
+              const ct = usage?.completion_tokens || 0;
+              store.incrementApiKeyUsage(clientKeyId, model, pt, ct).catch(e =>
+                console.error('[apikey-usage] increment failed:', e));
+            }).catch(() => {
+              store.incrementApiKeyUsage(clientKeyId, model, 0, 0).catch(() => {});
+            });
+
+            return new Response(stream, {
+              status: 200,
+              headers: {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'X-Accel-Buffering': 'no',
+                'Access-Control-Allow-Origin': '*',
+              },
+            });
+          }
+
+          if (isStream) {
+            console.warn(`[proxy][responses] upstream returned non-SSE for stream:true (Content-Type: ${resp.headers.get('Content-Type')}), falling back to non-streaming`);
+          }
+
+          const openaiData = await resp.json();
+          if (!Array.isArray(openaiData.choices)) {
+            lastError = `upstream returned invalid response (choices=${openaiData.choices})`;
+            logError(store, target, model, 200, lastError);
+            continue;
+          }
+
+          const pt = openaiData.usage?.prompt_tokens || 0;
+          const ct = openaiData.usage?.completion_tokens || 0;
+          store.incrementUsage(target.channel.id, target.key, model).catch(e =>
+            console.error('[usage] increment failed:', e));
+          store.incrementApiKeyUsage(clientKeyId, model, pt, ct).catch(e =>
+            console.error('[apikey-usage] increment failed:', e));
+
+          const responsesData = chatCompletionsToResponses(openaiData, model);
+          store.clearRateLimitCooldown(target.channel.id, target.key, model).catch(() => {});
+          return jsonRes(responsesData, 200);
+        }
+
+        lastError = `HTTP ${resp.status}`;
+        logError(store, target, model, resp.status, lastError);
+      } catch (err) {
+        lastError = err.message;
+        logError(store, target, model, 0, lastError);
+      }
+    }
+
+    if (consecutive429 === 0 || consecutive429 < targets.length) break;
+  }
+
+  const detail = last429Body ? ` | upstream: ${last429Body.slice(0, 200)}` : '';
+  return responsesErrorRes(`All targets failed. Last error: ${lastError}${detail}`, 502);
 }
 
 // ─── OpenAI passthrough handler ────────────────────────────────────
 
-async function handleOpenAIProxy(request, url, path, body, store) {
+async function handleOpenAIProxy(request, url, path, body, store, allowedChannelIds, clientKeyId) {
   const model = body.model || '';
   const lb = new LoadBalancer(store);
-  const { targets, error } = await lb.selectTarget(model);
+  const { targets, error } = await lb.selectTarget(model, allowedChannelIds);
 
   if (error || targets.length === 0) {
     return jsonRes({
@@ -131,77 +368,190 @@ async function handleOpenAIProxy(request, url, path, body, store) {
   // Strip /v1 prefix, keep the rest (e.g. /chat/completions)
   const upstreamPath = path.replace(/^\/v1/, '');
 
-  // Try each target in order (failover on 5xx / network error)
-  let lastError = null;
-  for (const target of targets) {
-    try {
-      const baseUrl = target.channel.base_url.replace(/\/+$/, '');
-      const targetUrl = baseUrl + upstreamPath + url.search;
-
-      console.log(`[proxy] -> ${target.channel.name} ${targetUrl}`);
-
-      const headers = new Headers();
-      headers.set('Content-Type', 'application/json');
-      headers.set('Authorization', `Bearer ${target.key}`);
-
-      // Forward Accept header (important for streaming)
-      const accept = request.headers.get('Accept');
-      if (accept) headers.set('Accept', accept);
-
-      const resp = await fetch(targetUrl, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(body),
-      });
-
-      // Success or client-side error (4xx) — return immediately, don't retry
-      if (resp.ok || resp.status < 500) {
-        const respHeaders = new Headers();
-        const ct = resp.headers.get('Content-Type');
-        if (ct) respHeaders.set('Content-Type', ct);
-        respHeaders.set('Access-Control-Allow-Origin', '*');
-
-        if (body.stream) {
-          respHeaders.set('Cache-Control', 'no-cache');
-        }
-
-        return new Response(resp.body, {
-          status: resp.status,
-          headers: respHeaders,
-        });
-      }
-
-      // 5xx — try next target
-      lastError = `${target.channel.name}: HTTP ${resp.status}`;
-      console.error(`[proxy] target failed: ${lastError}`);
-    } catch (err) {
-      lastError = `${target.channel.name}: ${err.message}`;
-      console.error(`[proxy] target error: ${lastError}`);
-    }
+  // 参考 one-api：流式请求注入 stream_options，让上游在最后一个 chunk 返回 token 用量
+  if (body.stream) {
+    if (!body.stream_options) body.stream_options = {};
+    body.stream_options.include_usage = true;
   }
 
+  // Try each target in order (failover on 5xx / network error)
+  // 429 退避：共享 IP 环境（如 HF Spaces）下上游可能按 IP 限流，
+  // 需要在连续 429 之间加入延迟，并支持整轮重试
+  const MAX_429_ROUNDS = 2;
+  let lastError = null;
+  let last429Body = '';
+
+  for (let round = 0; round < MAX_429_ROUNDS; round++) {
+    if (round > 0) {
+      console.log(`[proxy] all targets returned 429, retry round ${round + 1} after delay`);
+      await sleep(3000 * round);
+    }
+    let consecutive429 = 0;
+
+    for (const target of targets) {
+      try {
+        const baseUrl = target.channel.base_url.replace(/\/+$/, '');
+        const targetUrl = baseUrl + upstreamPath + url.search;
+
+        console.log(`[proxy] -> ${target.channel.name} ${targetUrl}${round > 0 ? ` (retry #${round})` : ''}`);
+
+        const headers = new Headers();
+        headers.set('Content-Type', 'application/json');
+        headers.set('Authorization', `Bearer ${target.key}`);
+
+        // Forward Accept header (important for streaming)
+        const accept = request.headers.get('Accept');
+        if (accept) headers.set('Accept', accept);
+
+        const resp = await fetch(targetUrl, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(body),
+        });
+        const rateHeaders = extractRateLimitHeaders(resp.headers);
+        if (rateHeaders.hasAny) {
+          store.updateRateLimitHeaders(target.channel.id, target.key, model, rateHeaders).catch(e =>
+            console.error('[ratelimit] update headers failed:', e)
+          );
+        }
+
+        if (resp.status === 404) {
+          lastError = `HTTP 404 (model not found)`;
+          logError(store, target, model, 404, lastError);
+          continue;
+        }
+
+        if (resp.status === 429) {
+          consecutive429++;
+          try { last429Body = await resp.text(); } catch { last429Body = ''; }
+          lastError = `HTTP 429 (rate limited)`;
+          const rlReason = await classifyAndRecord429(store, target, model, resp, rateHeaders);
+          logError(store, target, model, 429, `${lastError}${rlReason ? `: ${rlReason}` : ''}`);
+          await sleep(calc429Delay(rateHeaders, consecutive429));
+          continue;
+        }
+
+        if (resp.ok || resp.status < 500) {
+          if (!resp.ok) {
+            logError(store, target, model, resp.status, `HTTP ${resp.status}`);
+          }
+
+          const respHeaders = new Headers();
+          const ct = resp.headers.get('Content-Type');
+          if (ct) respHeaders.set('Content-Type', ct);
+          respHeaders.set('Access-Control-Allow-Origin', '*');
+
+          // 上游返回 SSE 流时才走流式处理；某些上游在异常情况下即使收到
+          // stream:true 也会返回普通 JSON（choices:null），此时走非流式验证路径
+          const upstreamIsSSE = body.stream &&
+            (ct || '').includes('text/event-stream');
+
+          if (upstreamIsSSE) {
+            store.clearRateLimitCooldown(target.channel.id, target.key, model).catch(() => {});
+            // 禁用 nginx 缓冲（HF Spaces 必须），否则代理会缓冲整个流导致 ECONNRESET
+            respHeaders.set('Content-Type', 'text/event-stream');
+            respHeaders.set('Cache-Control', 'no-cache');
+            respHeaders.set('Connection', 'keep-alive');
+            respHeaders.set('X-Accel-Buffering', 'no');
+
+            // 处理流：修复 id 字段 + 捕获 usage（参考 one-api 流式 token 统计方案）
+            const { stream, usagePromise } = processStream(resp.body);
+
+            if (resp.ok) {
+              // 渠道用量立即记录（仅计数）
+              store.incrementUsage(target.channel.id, target.key, model).catch(e =>
+                console.error('[usage] increment failed:', e));
+              // API 密钥用量在流结束后记录（含 token 数）
+              usagePromise.then(usage => {
+                const pt = usage?.prompt_tokens || 0;
+                const ct = usage?.completion_tokens || 0;
+                store.incrementApiKeyUsage(clientKeyId, model, pt, ct).catch(e =>
+                  console.error('[apikey-usage] increment failed:', e));
+              }).catch(() => {
+                store.incrementApiKeyUsage(clientKeyId, model, 0, 0).catch(() => {});
+              });
+            }
+
+            return new Response(stream, { status: resp.status, headers: respHeaders });
+          }
+
+          // 上游对 stream:true 返回了非 SSE 响应，回退到非流式验证
+          if (body.stream) {
+            console.warn(`[proxy] 上游对 stream:true 返回了非 SSE 响应 (Content-Type: ${ct}), 回退到非流式验证`);
+          }
+
+          // Non-streaming: validate chat/completions responses
+          if (resp.ok && upstreamPath.includes('/chat/completions')) {
+            const respText = await resp.text();
+            let promptTokens = 0, completionTokens = 0;
+            try {
+              const data = JSON.parse(respText);
+              if (!Array.isArray(data.choices)) {
+                lastError = `upstream returned invalid response (choices=${data.choices})`;
+                logError(store, target, model, 200, lastError);
+                continue;
+              }
+              promptTokens = data.usage?.prompt_tokens || 0;
+              completionTokens = data.usage?.completion_tokens || 0;
+            } catch { /* not valid JSON — pass through as-is */ }
+            // 非流式：记录请求次数和 token 用量
+            store.incrementUsage(target.channel.id, target.key, model).catch(e =>
+              console.error('[usage] increment failed:', e));
+            store.incrementApiKeyUsage(clientKeyId, model, promptTokens, completionTokens).catch(e =>
+              console.error('[apikey-usage] increment failed:', e));
+            store.clearRateLimitCooldown(target.channel.id, target.key, model).catch(() => {});
+            return new Response(respText, { status: resp.status, headers: respHeaders });
+          }
+
+          // 其他非流式路径（embeddings 等）
+          if (resp.ok) {
+            store.incrementUsage(target.channel.id, target.key, model).catch(e =>
+              console.error('[usage] increment failed:', e));
+            store.incrementApiKeyUsage(clientKeyId, model, 0, 0).catch(e =>
+              console.error('[apikey-usage] increment failed:', e));
+            store.clearRateLimitCooldown(target.channel.id, target.key, model).catch(() => {});
+          }
+
+          return new Response(resp.body, { status: resp.status, headers: respHeaders });
+        }
+
+        lastError = `HTTP ${resp.status}`;
+        logError(store, target, model, resp.status, lastError);
+      } catch (err) {
+        lastError = err.message;
+        logError(store, target, model, 0, lastError);
+      }
+    }
+
+    // Only retry if all failures in this round were 429
+    if (consecutive429 === 0 || consecutive429 < targets.length) break;
+  }
+
+  const detail = last429Body ? ` | upstream: ${last429Body.slice(0, 200)}` : '';
   return jsonRes({
     error: {
-      message: `All targets failed. Last error: ${lastError}`,
+      message: `All targets failed. Last error: ${lastError}${detail}`,
       type: 'server_error',
     }
   }, 502);
 }
 
-async function handleModels(store) {
+async function handleModels(store, allowedChannelIds) {
   const channels = await store.getChannels();
-  const enabled = channels.filter(ch => ch.enabled);
+  let enabled = channels.filter(ch => ch.enabled);
+  if (allowedChannelIds && allowedChannelIds.length > 0) {
+    enabled = enabled.filter(ch => allowedChannelIds.includes(ch.id));
+  }
 
   // Collect models: use configured list if available, otherwise fetch from upstream
   const allModels = []; // { id, owned_by }
 
   const fetchPromises = enabled.map(async (ch) => {
     if (ch.models?.length > 0) {
-      // Use explicitly configured models
+      store.setModelCache(ch.id, ch.models).catch(() => {});
       return ch.models.map(m => ({ id: m, owned_by: ch.name }));
     }
 
-    // Fetch from upstream /models endpoint
     if (!ch.keys?.length) return [];
     const baseUrl = ch.base_url.replace(/\/+$/, '');
     try {
@@ -211,6 +561,10 @@ async function handleModels(store) {
       if (!resp.ok) return [];
       const data = await resp.json();
       if (data?.data && Array.isArray(data.data)) {
+        const modelIds = data.data.map(m => m.id);
+        store.setModelCache(ch.id, modelIds).catch(e =>
+          console.error(`[models] cache write failed for ${ch.name}:`, e)
+        );
         return data.data.map(m => ({
           id: m.id,
           owned_by: m.owned_by || ch.name,
@@ -244,8 +598,97 @@ async function handleModels(store) {
   });
 }
 
+function extractRateLimitHeaders(headers) {
+  const intOrNull = (v) => {
+    if (v == null) return null;
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? n : null;
+  };
+  const info = {
+    user_limit: intOrNull(headers.get('modelscope-ratelimit-requests-limit')),
+    user_remaining: intOrNull(headers.get('modelscope-ratelimit-requests-remaining')),
+    model_limit: intOrNull(headers.get('modelscope-ratelimit-model-requests-limit')),
+    model_remaining: intOrNull(headers.get('modelscope-ratelimit-model-requests-remaining')),
+    retry_after: intOrNull(headers.get('retry-after')),
+  };
+  info.hasAny =
+    info.user_limit !== null ||
+    info.user_remaining !== null ||
+    info.model_limit !== null ||
+    info.model_remaining !== null ||
+    info.retry_after !== null;
+  return info;
+}
+
+async function classifyAndRecord429(store, target, model, resp, rateHeaders) {
+  let errText = '';
+  try { errText = await resp.text(); } catch { errText = ''; }
+
+  let code = '';
+  let message = errText;
+  try {
+    const data = JSON.parse(errText || '{}');
+    code = String(data?.error?.code || data?.errors?.code || '').toLowerCase();
+    message = String(data?.error?.message || data?.errors?.message || errText || '');
+  } catch {
+    code = '';
+  }
+
+  const msg = message.toLowerCase();
+  const modelRemaining = Number.isFinite(rateHeaders?.model_remaining) ? rateHeaders.model_remaining : null;
+  const userRemaining = Number.isFinite(rateHeaders?.user_remaining) ? rateHeaders.user_remaining : null;
+
+  if ((modelRemaining !== null && modelRemaining <= 0) || (userRemaining !== null && userRemaining <= 0)) {
+    await store.markRateLimited(target.channel.id, target.key, model);
+    return 'daily quota exhausted';
+  }
+
+  const isBurst = code.includes('limit_burst_rate') || msg.includes('increased too quickly');
+  const isRequests = code.includes('limit_requests') || msg.includes('rate limit') || msg.includes('rate limited');
+  const retryAfterMs = (Number.isFinite(rateHeaders?.retry_after) && rateHeaders.retry_after > 0)
+    ? rateHeaders.retry_after * 1000
+    : null;
+  const cooldownMs = retryAfterMs || (isBurst ? 45 * 1000 : 90 * 1000);
+
+  if (isBurst || isRequests) {
+    await store.markRateLimitedTemporary(target.channel.id, target.key, model, cooldownMs);
+    return `temporary cooldown ${Math.ceil(cooldownMs / 1000)}s`;
+  }
+
+  await store.markRateLimitedTemporary(target.channel.id, target.key, model, 90 * 1000);
+  return 'temporary cooldown 90s';
+}
+
 function jsonRes(body, status = 200) {
   return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*',
+    },
+  });
+}
+
+function logError(store, target, model, status, message) {
+  const hint = target.key.length > 12 ? target.key.slice(0, 7) + '...' + target.key.slice(-4) : target.key;
+  store.appendError(target.channel.id, {
+    model, status, message: String(message).slice(0, 200), key_hint: hint,
+  }).catch(e => console.error('[errorlog] write failed:', e));
+}
+
+function responsesErrorRes(message, status = 500) {
+  return new Response(JSON.stringify({
+    id: 'resp_err_' + Date.now(),
+    object: 'response',
+    created_at: Math.floor(Date.now() / 1000),
+    status: 'failed',
+    error: {
+      code: 'server_error',
+      message,
+    },
+    output: [],
+    usage: null,
+  }), {
     status,
     headers: {
       'Content-Type': 'application/json',
@@ -268,4 +711,76 @@ function claudeErrorRes(message, status = 500) {
       'Access-Control-Allow-Origin': '*',
     },
   });
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+/**
+ * 429 退避策略：根据 retry-after 头或指数退避计算等待时间。
+ * HF Spaces 等共享 IP 环境下，上游(ModelScope)可能按 IP 限流，
+ * 需要在 failover 循环中加入延迟避免连续请求全部被拒。
+ */
+function calc429Delay(rateHeaders, attempt) {
+  if (rateHeaders?.retry_after > 0) {
+    return rateHeaders.retry_after * 1000;
+  }
+  return Math.min(2000 * Math.pow(1.5, attempt), 15000);
+}
+
+/**
+ * 处理 SSE 流：修复 id 字段 + 捕获 usage（参考 one-api 流式 token 统计方案）。
+ *
+ * 功能：
+ * 1. 修复上游返回 id: null 的问题（国内模型如 GLM 不遵循 OpenAI 规范）
+ * 2. 配合 stream_options.include_usage=true，从最后一个 chunk 捕获 token 用量
+ *
+ * 返回 { stream, usagePromise }：
+ * - stream: 修复后的 ReadableStream，可直接返回给客户端
+ * - usagePromise: 流结束后 resolve 为 { prompt_tokens, completion_tokens } 或 null
+ */
+function processStream(body) {
+  const dec = new TextDecoder();
+  const enc = new TextEncoder();
+  let buf = '';
+  let capturedUsage = null;
+  let resolveUsage;
+  const usagePromise = new Promise(resolve => { resolveUsage = resolve; });
+
+  const stream = body.pipeThrough(new TransformStream({
+    transform(chunk, ctrl) {
+      buf += dec.decode(chunk, { stream: true });
+      const parts = buf.split('\n\n');
+      buf = parts.pop() ?? '';
+
+      for (const part of parts) {
+        const trimmed = part.trim();
+        if (trimmed.startsWith('data: ') && trimmed !== 'data: [DONE]') {
+          try {
+            const data = JSON.parse(trimmed.slice(6));
+            // 过滤掉 choices 为 null 的无效 chunk（国内 API 常见异常）
+            if ('choices' in data && !Array.isArray(data.choices)) {
+              if (data.usage) capturedUsage = data.usage;
+              continue;
+            }
+            if (typeof data.id !== 'string') {
+              data.id = data.id != null ? String(data.id) : ('chatcmpl-' + Date.now());
+            }
+            // 捕获 usage（stream_options.include_usage=true 时上游在末尾 chunk 返回）
+            if (data.usage) {
+              capturedUsage = data.usage;
+            }
+            ctrl.enqueue(enc.encode('data: ' + JSON.stringify(data) + '\n\n'));
+            continue;
+          } catch { /* JSON 解析失败，原样透传 */ }
+        }
+        ctrl.enqueue(enc.encode(part + '\n\n'));
+      }
+    },
+    flush(ctrl) {
+      if (buf.trim()) ctrl.enqueue(enc.encode(buf));
+      resolveUsage(capturedUsage);
+    },
+  }));
+
+  return { stream, usagePromise };
 }
