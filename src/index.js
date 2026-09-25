@@ -15,7 +15,7 @@ export default {
         headers: {
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version',
+          'Access-Control-Allow-Headers': 'Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta, OpenAI-Beta, x-client-request-id, session-id, thread-id',
           'Access-Control-Max-Age': '86400',
         },
       });

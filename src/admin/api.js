@@ -28,6 +28,11 @@ export async function handleAdminApi(request, env, store) {  const url = new URL
         quota_enabled: !!data.quota_enabled,
         quota_daily_total: Math.max(0, parseInt(data.quota_daily_total) || 0),
         quota_daily_per_model: Math.max(0, parseInt(data.quota_daily_per_model) || 0),
+        // Protocol modes are optional. `auto` detects OpenAI/OpenRouter and
+        // Anthropic-compatible endpoints; explicit native/chat overrides are
+        // useful for private proxies with non-standard hostnames.
+        responses_mode: normalizeProtocolMode(data.responses_mode),
+        messages_mode: normalizeProtocolMode(data.messages_mode),
         created_at: new Date().toISOString(),
       };
       channels.push(channel);
@@ -59,6 +64,12 @@ export async function handleAdminApi(request, env, store) {  const url = new URL
           quota_enabled: data.quota_enabled !== undefined ? !!data.quota_enabled : (ch.quota_enabled || false),
           quota_daily_total: data.quota_daily_total !== undefined ? Math.max(0, parseInt(data.quota_daily_total) || 0) : (ch.quota_daily_total || 0),
           quota_daily_per_model: data.quota_daily_per_model !== undefined ? Math.max(0, parseInt(data.quota_daily_per_model) || 0) : (ch.quota_daily_per_model || 0),
+          responses_mode: data.responses_mode !== undefined
+            ? normalizeProtocolMode(data.responses_mode)
+            : (ch.responses_mode || 'auto'),
+          messages_mode: data.messages_mode !== undefined
+            ? normalizeProtocolMode(data.messages_mode)
+            : (ch.messages_mode || 'auto'),
           id,
         };
         await store.saveChannels(channels);
@@ -290,6 +301,10 @@ export async function handleAdminApi(request, env, store) {  const url = new URL
     console.error('Admin API error:', err);
     return jsonRes({ error: err.message || 'Internal error' }, 500);
   }
+}
+
+function normalizeProtocolMode(value) {
+  return value === 'native' || value === 'chat' ? value : 'auto';
 }
 
 function generateApiKeyString() {

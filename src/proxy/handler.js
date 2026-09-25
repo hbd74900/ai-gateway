@@ -1,7 +1,7 @@
 import { verifyApiKey } from './auth.js';
 import { LoadBalancer } from '../lb/balancer.js';
-import { claudeToOpenAI, openAIToClaude, openAIStreamToClaudeStream } from './claude.js';
-import { responsesToChatCompletions, chatCompletionsToResponses, chatCompletionsStreamToResponsesStream, usesNativeResponses, observeResponsesStream } from './responses.js';
+import { claudeToOpenAI, openAIToClaude, openAIStreamToClaudeStream, usesNativeMessages, observeClaudeStream } from './claude.js';
+import { responsesToChatCompletions, getCustomToolNames, chatCompletionsToResponses, chatCompletionsStreamToResponsesStream, usesNativeResponses, observeResponsesStream } from './responses.js';
 
 export async function handleProxy(request, env, store) {
   // Verify client API key
@@ -35,7 +35,10 @@ export async function handleProxy(request, env, store) {
     return jsonRes({ error: { message: 'Invalid JSON body' } }, 400);
   }
 
-  // ---- Claude Messages API (/v1/messages) ----
+  // ---- Claude Messages API (including count_tokens) ----
+  if (path.endsWith('/messages/count_tokens')) {
+    return handleClaudeCountTokens(request, url, body, store, allowedChannelIds, clientKeyId);
+  }
   if (path.endsWith('/messages')) {
     return handleClaudeMessages(request, url, body, store, allowedChannelIds, clientKeyId);
   }
@@ -51,16 +54,73 @@ export async function handleProxy(request, env, store) {
 
 // ─── Claude Messages API handler ───────────────────────────────────
 
+async function handleClaudeCountTokens(request, url, claudeBody, store, allowedChannelIds) {
+  if (!claudeBody || typeof claudeBody.model !== 'string' || !claudeBody.model.trim()) {
+    return claudeErrorRes('model is required', 400);
+  }
+  const model = claudeBody.model;
+  const lb = new LoadBalancer(store);
+  const { targets, error } = await lb.selectTarget(model, allowedChannelIds);
+  if (error || targets.length === 0) {
+    return claudeErrorRes(error || 'No available channel for model: ' + model, 503);
+  }
+
+  for (const target of targets) {
+    try {
+      const baseUrl = target.channel.base_url.replace(/\/+$/, '');
+      const native = usesNativeMessages(target.channel);
+      const targetUrl = baseUrl + (native ? '/messages/count_tokens' : '/chat/completions');
+      const headers = new Headers({ 'Content-Type': 'application/json' });
+      if (native && new URL(target.channel.base_url).hostname === 'api.anthropic.com') {
+        headers.set('x-api-key', target.key);
+      } else {
+        headers.set('Authorization', `Bearer ${target.key}`);
+      }
+      if (native) headers.set('anthropic-version', request.headers.get('anthropic-version') || '2023-06-01');
+      const anthropicBeta = request.headers.get('anthropic-beta');
+      if (native && anthropicBeta) headers.set('anthropic-beta', anthropicBeta);
+      copyForwardHeaders(request.headers, headers, CLAUDE_FORWARD_HEADERS);
+
+      if (native) {
+        const resp = await fetch(targetUrl, { method: 'POST', headers, body: JSON.stringify(claudeBody) });
+        const text = await resp.text();
+        return new Response(text, {
+          status: resp.status,
+          headers: { 'Content-Type': resp.headers.get('Content-Type') || 'application/json', 'Access-Control-Allow-Origin': '*' },
+        });
+      }
+
+      // There is no portable Chat Completions token-count endpoint.  This
+      // deterministic estimate is only used for non-native upstreams; native
+      // Anthropic/OpenRouter targets above return the provider's exact count.
+      const converted = claudeToOpenAI(claudeBody);
+      const serialized = JSON.stringify({ messages: converted.messages, tools: converted.tools || [] });
+      const inputTokens = Math.max(1, Math.ceil(serialized.length / 4));
+      return jsonRes({ input_tokens: inputTokens });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return claudeErrorRes(message, 502);
+    }
+  }
+  return claudeErrorRes('No available channel for model: ' + model, 503);
+}
+
 async function handleClaudeMessages(request, url, claudeBody, store, allowedChannelIds, clientKeyId) {
-  const model = claudeBody.model || '';
+  if (!claudeBody || typeof claudeBody.model !== 'string' || !claudeBody.model.trim()) {
+    return claudeErrorRes('model is required', 400);
+  }
+  const model = claudeBody.model;
   const isStream = claudeBody.stream || false;
 
-  // Convert Claude request to OpenAI format
-  const openaiBody = claudeToOpenAI(claudeBody);
-
-  // 参考 one-api：流式请求注入 stream_options，让上游返回 token 用量
-  if (isStream) {
-    openaiBody.stream_options = { include_usage: true };
+  // Conversion is target-specific. Native Messages upstreams (notably
+  // OpenRouter) must receive the original body so signatures and beta fields
+  // are not lost; Chat targets are converted below.
+  let baseOpenaiBody;
+  let baseConversionError = null;
+  try {
+    baseOpenaiBody = claudeToOpenAI(claudeBody);
+  } catch (error) {
+    baseConversionError = error instanceof Error ? error.message : String(error);
   }
 
   const lb = new LoadBalancer(store);
@@ -85,19 +145,40 @@ async function handleClaudeMessages(request, url, claudeBody, store, allowedChan
     for (const target of targets) {
       try {
         const baseUrl = target.channel.base_url.replace(/\/+$/, '');
-        const targetUrl = baseUrl + '/chat/completions' + url.search;
+        const nativeMessages = usesNativeMessages(target.channel);
+        const targetUrl = baseUrl + (nativeMessages ? '/messages' : '/chat/completions') + url.search;
+        let openaiBody = null;
+        if (!nativeMessages) {
+          if (baseConversionError) {
+            return claudeErrorRes(baseConversionError, 400);
+          }
+          openaiBody = isOpenRouterChannel(target.channel)
+            ? claudeToOpenAI(claudeBody, { openRouter: true })
+            : { ...baseOpenaiBody };
+          if (isStream) openaiBody.stream_options = { include_usage: true };
+        }
 
         console.log(`[proxy][claude] -> ${target.channel.name} ${targetUrl}${round > 0 ? ` (retry #${round})` : ''}`);
 
         const headers = new Headers();
         headers.set('Content-Type', 'application/json');
-        headers.set('Authorization', `Bearer ${target.key}`);
+        if (nativeMessages && new URL(target.channel.base_url).hostname === 'api.anthropic.com') {
+          headers.set('x-api-key', target.key);
+        } else {
+          headers.set('Authorization', `Bearer ${target.key}`);
+        }
+        if (nativeMessages) {
+          headers.set('anthropic-version', request.headers.get('anthropic-version') || '2023-06-01');
+        }
+        const anthropicBeta = request.headers.get('anthropic-beta');
+        if (nativeMessages && anthropicBeta) headers.set('anthropic-beta', anthropicBeta);
+        copyForwardHeaders(request.headers, headers, CLAUDE_FORWARD_HEADERS);
         if (isStream) headers.set('Accept', 'text/event-stream');
 
         const resp = await fetch(targetUrl, {
           method: 'POST',
           headers,
-          body: JSON.stringify(openaiBody),
+          body: nativeMessages ? JSON.stringify(claudeBody) : JSON.stringify(openaiBody),
         });
         const rateHeaders = extractRateLimitHeaders(resp.headers);
         if (rateHeaders.hasAny) {
@@ -126,6 +207,12 @@ async function handleClaudeMessages(request, url, claudeBody, store, allowedChan
           if (!resp.ok) {
             const errBody = await resp.text();
             logError(store, target, model, resp.status, errBody);
+            if (nativeMessages) {
+              return new Response(errBody, {
+                status: resp.status,
+                headers: responseHeaders(resp.headers),
+              });
+            }
             return claudeErrorRes(`Upstream error: ${errBody}`, resp.status);
           }
 
@@ -140,14 +227,21 @@ async function handleClaudeMessages(request, url, claudeBody, store, allowedChan
             store.incrementUsage(target.channel.id, target.key, model).catch(e =>
               console.error('[usage] increment failed:', e));
 
-            // 参考 one-api：先通过 processStream 捕获流式 usage，再转换为 Claude 格式
-            const { stream: processedStream, usagePromise } = processStream(resp.body);
-            const claudeStream = openAIStreamToClaudeStream(processedStream, model);
+            const observed = nativeMessages
+              ? observeClaudeStream(resp.body)
+              : (() => {
+                  const processed = processStream(resp.body);
+                  return {
+                    stream: openAIStreamToClaudeStream(processed.stream, model),
+                    usagePromise: processed.usagePromise,
+                  };
+                })();
+            const claudeStream = observed.stream;
 
             // 流结束后异步记录 API 密钥用量（含 token 数）
-            usagePromise.then(usage => {
-              const pt = usage?.prompt_tokens || 0;
-              const ct = usage?.completion_tokens || 0;
+            observed.usagePromise.then(usage => {
+              const pt = usage?.prompt_tokens ?? usage?.input_tokens ?? 0;
+              const ct = usage?.completion_tokens ?? usage?.output_tokens ?? 0;
               store.incrementApiKeyUsage(clientKeyId, model, pt, ct).catch(e =>
                 console.error('[apikey-usage] increment failed:', e));
             }).catch(() => {
@@ -156,14 +250,7 @@ async function handleClaudeMessages(request, url, claudeBody, store, allowedChan
 
             return new Response(claudeStream, {
               status: 200,
-              headers: {
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-                // 禁用 nginx 缓冲，确保 HF Spaces 代理实时转发流式数据
-                'X-Accel-Buffering': 'no',
-                'Access-Control-Allow-Origin': '*',
-              },
+              headers: responseHeaders(resp.headers, true),
             });
           }
 
@@ -172,6 +259,20 @@ async function handleClaudeMessages(request, url, claudeBody, store, allowedChan
             console.warn(`[proxy][claude] 上游对 stream:true 返回了非 SSE 响应 (Content-Type: ${resp.headers.get('Content-Type')}), 回退到非流式验证`);
           }
           const openaiData = await resp.json();
+          if (nativeMessages) {
+            store.incrementUsage(target.channel.id, target.key, model).catch(e =>
+              console.error('[usage] increment failed:', e));
+            const usage = openaiData.usage || {};
+            store.incrementApiKeyUsage(clientKeyId, model,
+              usage.input_tokens ?? usage.prompt_tokens ?? 0,
+              usage.output_tokens ?? usage.completion_tokens ?? 0).catch(e =>
+                console.error('[apikey-usage] increment failed:', e));
+            store.clearRateLimitCooldown(target.channel.id, target.key, model).catch(() => {});
+            return new Response(JSON.stringify(openaiData), {
+              status: 200,
+              headers: responseHeaders(resp.headers),
+            });
+          }
           if (!Array.isArray(openaiData.choices)) {
             lastError = `upstream returned invalid response (choices=${openaiData.choices})`;
             logError(store, target, model, 200, lastError);
@@ -188,7 +289,10 @@ async function handleClaudeMessages(request, url, claudeBody, store, allowedChan
 
           const claudeResponse = openAIToClaude(openaiData, model);
           store.clearRateLimitCooldown(target.channel.id, target.key, model).catch(() => {});
-          return jsonRes(claudeResponse, 200);
+          return new Response(JSON.stringify(claudeResponse), {
+            status: 200,
+            headers: responseHeaders(resp.headers),
+          });
         }
 
         lastError = `HTTP ${resp.status}`;
@@ -209,13 +313,22 @@ async function handleClaudeMessages(request, url, claudeBody, store, allowedChan
 // ─── OpenAI Responses API handler ──────────────────────────────────
 
 async function handleResponses(request, url, body, store, allowedChannelIds, clientKeyId) {
-  const model = body.model || '';
-  const isStream = body.stream || false;
-
   if (!body || typeof body.model !== 'string' || !body.model.trim()) {
     return responsesErrorRes('model is required', 400);
   }
-  let openaiBody;
+  const model = body.model;
+  const isStream = body.stream || false;
+
+  let baseOpenaiBody;
+  let baseConversionError = null;
+  try {
+    // Build a fallback for Chat-only targets, but do not reject a request
+    // merely because a native Responses target can handle stateful/hosted
+    // features that the fallback cannot represent.
+    baseOpenaiBody = responsesToChatCompletions(body);
+  } catch (error) {
+    baseConversionError = error instanceof Error ? error.message : String(error);
+  }
 
   const lb = new LoadBalancer(store);
   const { targets, error } = await lb.selectTarget(model, allowedChannelIds);
@@ -238,14 +351,28 @@ async function handleResponses(request, url, body, store, allowedChannelIds, cli
     for (const target of targets) {
       try {
         const baseUrl = target.channel.base_url.replace(/\/+$/, '');
-        const native = usesNativeResponses(target.channel);
-        if (!openaiBody) {
-          openaiBody = responsesToChatCompletions(body);
-          if (isStream) {
-            openaiBody.stream_options = { include_usage: true };
+        const isNative = usesNativeResponses(target.channel);
+        if (!isNative && baseConversionError) {
+          return responsesErrorRes(baseConversionError, 400);
+        }
+        let openaiBody = null;
+        if (!isNative) {
+          openaiBody = isOpenRouterChannel(target.channel)
+            ? responsesToChatCompletions(body, { openRouter: true })
+            : { ...baseOpenaiBody };
+          if (!isOpenRouterChannel(target.channel)) {
+            Object.defineProperty(openaiBody, '__customToolNames', {
+              value: getCustomToolNames(baseOpenaiBody),
+              enumerable: false,
+            });
           }
         }
-        const isNative = native;
+        if (!isNative && isStream) {
+          openaiBody.stream_options = {
+            ...(openaiBody.stream_options || {}),
+            include_usage: true,
+          };
+        }
         const targetUrl = isNative
           ? baseUrl + '/responses' + url.search
           : baseUrl + '/chat/completions' + url.search;
@@ -255,6 +382,7 @@ async function handleResponses(request, url, body, store, allowedChannelIds, cli
         const headers = new Headers();
         headers.set('Content-Type', 'application/json');
         headers.set('Authorization', `Bearer ${target.key}`);
+        copyForwardHeaders(request.headers, headers, RESPONSES_FORWARD_HEADERS);
         if (isStream) headers.set('Accept', 'text/event-stream');
 
         const resp = await fetch(targetUrl, {
@@ -289,6 +417,12 @@ async function handleResponses(request, url, body, store, allowedChannelIds, cli
           if (!resp.ok) {
             const errBody = await resp.text();
             logError(store, target, model, resp.status, errBody);
+            if (isNative) {
+              return new Response(errBody, {
+                status: resp.status,
+                headers: responseHeaders(resp.headers),
+              });
+            }
             return responsesErrorRes(`Upstream error: ${errBody}`, resp.status);
           }
 
@@ -302,7 +436,9 @@ async function handleResponses(request, url, body, store, allowedChannelIds, cli
 
             const observed = isNative
               ? observeResponsesStream(resp.body)
-              : chatCompletionsStreamToResponsesStream(resp.body, model);
+              : chatCompletionsStreamToResponsesStream(resp.body, model, {
+                  customToolNames: getCustomToolNames(openaiBody),
+                });
 
             observed.usagePromise.then(usage => {
               const pt = usage?.prompt_tokens || 0;
@@ -315,25 +451,8 @@ async function handleResponses(request, url, body, store, allowedChannelIds, cli
 
             return new Response(observed.stream, {
               status: 200,
-              headers: {
-                'Content-Type': 'text/event-stream',
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-                'X-Accel-Buffering': 'no',
-                'Access-Control-Allow-Origin': '*',
-              },
+              headers: responseHeaders(resp.headers, true),
             });
-          }
-
-          if (isNative) {
-            store.incrementUsage(target.channel.id, target.key, model).catch(e =>
-              console.error('[usage] increment failed:', e));
-            const usage = body.usage || {};
-            store.incrementApiKeyUsage(clientKeyId, model,
-              usage.input_tokens || 0, usage.output_tokens || 0).catch(e =>
-              console.error('[apikey-usage] increment failed:', e));
-            store.clearRateLimitCooldown(target.channel.id, target.key, model).catch(() => {});
-            return jsonRes(body, 200);
           }
 
           if (isStream) {
@@ -341,6 +460,20 @@ async function handleResponses(request, url, body, store, allowedChannelIds, cli
           }
 
           const openaiData = await resp.json();
+          if (isNative) {
+            store.incrementUsage(target.channel.id, target.key, model).catch(e =>
+              console.error('[usage] increment failed:', e));
+            const usage = openaiData.usage || {};
+            store.incrementApiKeyUsage(clientKeyId, model,
+              usage.input_tokens ?? usage.prompt_tokens ?? 0,
+              usage.output_tokens ?? usage.completion_tokens ?? 0).catch(e =>
+              console.error('[apikey-usage] increment failed:', e));
+            store.clearRateLimitCooldown(target.channel.id, target.key, model).catch(() => {});
+            return new Response(JSON.stringify(openaiData), {
+              status: 200,
+              headers: responseHeaders(resp.headers),
+            });
+          }
           if (!Array.isArray(openaiData.choices)) {
             lastError = `upstream returned invalid response (choices=${openaiData.choices})`;
             logError(store, target, model, 200, lastError);
@@ -354,9 +487,14 @@ async function handleResponses(request, url, body, store, allowedChannelIds, cli
           store.incrementApiKeyUsage(clientKeyId, model, pt, ct).catch(e =>
             console.error('[apikey-usage] increment failed:', e));
 
-          const responsesData = chatCompletionsToResponses(openaiData, model);
+          const responsesData = chatCompletionsToResponses(openaiData, model, {
+            customToolNames: getCustomToolNames(openaiBody),
+          });
           store.clearRateLimitCooldown(target.channel.id, target.key, model).catch(() => {});
-          return jsonRes(responsesData, 200);
+          return new Response(JSON.stringify(responsesData), {
+            status: 200,
+            headers: responseHeaders(resp.headers),
+          });
         }
 
         lastError = `HTTP ${resp.status}`;
@@ -420,6 +558,7 @@ async function handleOpenAIProxy(request, url, path, body, store, allowedChannel
         const headers = new Headers();
         headers.set('Content-Type', 'application/json');
         headers.set('Authorization', `Bearer ${target.key}`);
+        copyForwardHeaders(request.headers, headers, OPENAI_FORWARD_HEADERS);
 
         // Forward Accept header (important for streaming)
         const accept = request.headers.get('Accept');
@@ -569,33 +708,39 @@ async function handleModels(store, allowedChannelIds) {
   const allModels = []; // { id, owned_by }
 
   const fetchPromises = enabled.map(async (ch) => {
-    if (ch.models?.length > 0) {
-      store.setModelCache(ch.id, ch.models).catch(() => {});
-      return ch.models.map(m => ({ id: m, owned_by: ch.name }));
+    const configuredModels = Array.isArray(ch.models) ? ch.models : [];
+    if (!ch.keys?.length) {
+      return configuredModels.map(m => ({ id: m, owned_by: ch.name }));
     }
 
-    if (!ch.keys?.length) return [];
     const baseUrl = ch.base_url.replace(/\/+$/, '');
     try {
       const resp = await fetch(baseUrl + '/models', {
         headers: { 'Authorization': `Bearer ${ch.keys[0]}` },
       });
-      if (!resp.ok) return [];
+      if (!resp.ok) {
+        return configuredModels.map(m => ({ id: m, owned_by: ch.name }));
+      }
       const data = await resp.json();
       if (data?.data && Array.isArray(data.data)) {
         const modelIds = data.data.map(m => m.id);
         store.setModelCache(ch.id, modelIds).catch(e =>
           console.error(`[models] cache write failed for ${ch.name}:`, e)
         );
+        const upstreamById = new Map(data.data.map(m => [m.id, m]));
+        if (configuredModels.length > 0) {
+          return configuredModels.map(id => upstreamById.get(id) || { id, owned_by: ch.name });
+        }
         return data.data.map(m => ({
+          ...m,
           id: m.id,
           owned_by: m.owned_by || ch.name,
         }));
       }
-      return [];
+      return configuredModels.map(m => ({ id: m, owned_by: ch.name }));
     } catch {
       console.error(`[models] Failed to fetch models from ${ch.name}`);
-      return [];
+      return configuredModels.map(m => ({ id: m, owned_by: ch.name }));
     }
   });
 
@@ -603,20 +748,16 @@ async function handleModels(store, allowedChannelIds) {
   const modelMap = new Map(); // deduplicate by model id
   for (const models of results) {
     for (const m of models) {
-      if (!modelMap.has(m.id)) {
-        modelMap.set(m.id, m);
+      const existing = modelMap.get(m.id);
+      if (!existing || (!existing.reasoning && m.reasoning)) {
+        modelMap.set(m.id, existing ? { ...existing, ...m, id: m.id } : m);
       }
     }
   }
 
   return jsonRes({
     object: 'list',
-    data: Array.from(modelMap.values()).map(m => ({
-      id: m.id,
-      object: 'model',
-      created: 0,
-      owned_by: m.owned_by,
-    })),
+    data: Array.from(modelMap.values()).map(m => normalizePublicModel(m)),
   });
 }
 
@@ -705,7 +846,7 @@ function responsesErrorRes(message, status = 500) {
     created_at: Math.floor(Date.now() / 1000),
     status: 'failed',
     error: {
-      code: 'server_error',
+      code: status >= 500 ? 'server_error' : 'invalid_request_error',
       message,
     },
     output: [],
@@ -723,7 +864,7 @@ function claudeErrorRes(message, status = 500) {
   return new Response(JSON.stringify({
     type: 'error',
     error: {
-      type: 'api_error',
+      type: status >= 500 ? 'api_error' : 'invalid_request_error',
       message,
     },
   }), {
@@ -733,6 +874,83 @@ function claudeErrorRes(message, status = 500) {
       'Access-Control-Allow-Origin': '*',
     },
   });
+}
+
+// Headers that are safe and meaningful when a client protocol is relayed to
+// an upstream protocol. Authentication and hop-by-hop headers are handled
+// separately and are never copied from the client.
+const CLAUDE_FORWARD_HEADERS = [
+  'anthropic-version', 'anthropic-beta', 'x-client-request-id',
+  'x-stainless-lang', 'x-stainless-package-version', 'x-stainless-os',
+  'x-stainless-arch', 'x-stainless-runtime', 'x-stainless-runtime-version',
+  'x-stainless-retry-count', 'x-stainless-timeout',
+];
+const RESPONSES_FORWARD_HEADERS = [
+  'OpenAI-Beta',
+  'x-client-request-id', 'x-openai-subagent', 'originator',
+  'session-id', 'thread-id', 'x-codex-turn-state',
+  'x-stainless-lang', 'x-stainless-package-version', 'x-stainless-os',
+  'x-stainless-arch', 'x-stainless-runtime', 'x-stainless-runtime-version',
+  'x-stainless-retry-count', 'x-stainless-timeout',
+];
+const OPENAI_FORWARD_HEADERS = [
+  'OpenAI-Beta',
+  'x-client-request-id', 'x-openai-subagent', 'originator',
+  'session-id', 'thread-id', 'x-codex-turn-state',
+];
+
+function copyForwardHeaders(source, target, names) {
+  for (const name of names) {
+    const value = source.get(name);
+    if (value !== null) target.set(name, value);
+  }
+}
+
+function responseHeaders(upstream, streaming = false) {
+  const headers = new Headers();
+  const contentType = upstream.get('Content-Type');
+  headers.set('Content-Type', contentType || (streaming ? 'text/event-stream' : 'application/json'));
+  for (const name of [
+    'x-request-id', 'openai-model', 'x-openai-model', 'x-models-etag',
+    'x-reasoning-included', 'retry-after',
+  ]) {
+    const value = upstream.get(name);
+    if (value !== null) headers.set(name, value);
+  }
+  headers.set('Access-Control-Allow-Origin', '*');
+  if (streaming) {
+    headers.set('Cache-Control', 'no-cache');
+    headers.set('Connection', 'keep-alive');
+    headers.set('X-Accel-Buffering', 'no');
+  }
+  return headers;
+}
+
+function normalizePublicModel(model) {
+  const output = {
+    id: model.id,
+    object: 'model',
+    created: model.created || 0,
+    owned_by: model.owned_by || 'unknown',
+  };
+  // Preserve capability metadata when an upstream provides it. This is
+  // especially useful for OpenRouter's reasoning object and supported
+  // parameters; older OpenAI servers simply omit these fields.
+  for (const key of [
+    'context_length', 'architecture', 'supported_parameters',
+    'default_parameters', 'pricing', 'top_provider', 'reasoning',
+  ]) {
+    if (model[key] !== undefined) output[key] = model[key];
+  }
+  return output;
+}
+
+function isOpenRouterChannel(channel) {
+  try {
+    return new URL(channel.base_url).hostname === 'openrouter.ai';
+  } catch {
+    return false;
+  }
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -781,7 +999,14 @@ function processStream(body) {
             const data = JSON.parse(trimmed.slice(6));
             // 过滤掉 choices 为 null 的无效 chunk（国内 API 常见异常）
             if ('choices' in data && !Array.isArray(data.choices)) {
-              if (data.usage) capturedUsage = data.usage;
+              if (data.usage) {
+                // A final usage-only chunk is a valid Chat Completions SSE
+                // chunk. Preserve it so the protocol converters can put the
+                // cumulative usage in their terminal event.
+                capturedUsage = data.usage;
+                ctrl.enqueue(enc.encode('data: ' + JSON.stringify(data) + '\n\n'));
+              }
+              // Other choices:null chunks are provider-specific noise.
               continue;
             }
             if (typeof data.id !== 'string') {

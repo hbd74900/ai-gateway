@@ -310,6 +310,12 @@ const I18N = {
     modelsHelp: 'Only requests for these models will route to this channel. Leave empty to accept any model.',
     priorityHelp: 'Lower = higher priority. Tried first.',
     weightHelp: 'Relative weight within same priority group.',
+    responsesMode: 'Responses API mode',
+    messagesMode: 'Claude Messages mode',
+    modeAuto: 'Auto detect',
+    modeNative: 'Native protocol',
+    modeChat: 'Chat fallback',
+    protocolModeHelp: 'Auto detects OpenRouter/OpenAI and Anthropic-compatible endpoints. Use Native for a private proxy that implements the endpoint; Chat converts to Chat Completions.',
     cancel: 'Cancel',
     save: 'Save',
     generateKey: 'Generate Key',
@@ -446,6 +452,12 @@ const I18N = {
     modelsHelp: '仅匹配这些模型的请求会路由到此渠道。留空则接受任何模型。',
     priorityHelp: '数值越小优先级越高，优先尝试。',
     weightHelp: '同优先级组内的相对权重。',
+    responsesMode: 'Responses API 模式',
+    messagesMode: 'Claude Messages 模式',
+    modeAuto: '自动检测',
+    modeNative: '原生协议',
+    modeChat: 'Chat 转换',
+    protocolModeHelp: '自动检测 OpenRouter/OpenAI 和 Anthropic 兼容端点；私有代理可手动选择原生协议或 Chat 转换。',
     cancel: '取消',
     save: '保存',
     generateKey: '生成密钥',
@@ -816,6 +828,25 @@ function showChModal(id) {
         <div class="form-help">\${t('weightHelp')}</div>
       </div>
     </div>
+    <div class="form-row">
+      <div class="form-group">
+        <label>\${t('responsesMode')}</label>
+        <select id="f-responses-mode">
+          <option value="auto" \${(!ch || !ch.responses_mode || ch.responses_mode === 'auto') ? 'selected' : ''}>\${t('modeAuto')}</option>
+          <option value="native" \${ch?.responses_mode === 'native' ? 'selected' : ''}>\${t('modeNative')}</option>
+          <option value="chat" \${ch?.responses_mode === 'chat' ? 'selected' : ''}>\${t('modeChat')}</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label>\${t('messagesMode')}</label>
+        <select id="f-messages-mode">
+          <option value="auto" \${(!ch || !ch.messages_mode || ch.messages_mode === 'auto') ? 'selected' : ''}>\${t('modeAuto')}</option>
+          <option value="native" \${ch?.messages_mode === 'native' ? 'selected' : ''}>\${t('modeNative')}</option>
+          <option value="chat" \${ch?.messages_mode === 'chat' ? 'selected' : ''}>\${t('modeChat')}</option>
+        </select>
+        <div class="form-help">\${t('protocolModeHelp')}</div>
+      </div>
+    </div>
     <div style="border-top:1px solid var(--border);margin:8px 0 16px;padding-top:16px">
       <label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:12px">
         <input type="checkbox" id="f-quota" \${ch?.quota_enabled ? 'checked' : ''} style="width:auto" onchange="document.getElementById('quota-fields').style.display=this.checked?'grid':'none'">
@@ -849,6 +880,8 @@ async function saveCh(id) {
   const models = document.getElementById('f-models').value.split('\\n').map(s=>s.trim()).filter(Boolean);
   const priority = parseInt(document.getElementById('f-pri').value) || 0;
   const weight = parseInt(document.getElementById('f-wt').value) || 1;
+  const responses_mode = document.getElementById('f-responses-mode').value;
+  const messages_mode = document.getElementById('f-messages-mode').value;
 
   const quota_enabled = document.getElementById('f-quota').checked;
   const quota_daily_total = parseInt(document.getElementById('f-qt').value) || 0;
@@ -856,7 +889,7 @@ async function saveCh(id) {
 
   if (!name || !base_url) { toast(t('nameUrlRequired'), 'error'); return; }
 
-  const body = JSON.stringify({ name, base_url, keys, models, priority, weight, quota_enabled, quota_daily_total, quota_daily_per_model });
+  const body = JSON.stringify({ name, base_url, keys, models, priority, weight, responses_mode, messages_mode, quota_enabled, quota_daily_total, quota_daily_per_model });
   const r = id
     ? await api('/channels/' + id, { method: 'PUT', body })
     : await api('/channels', { method: 'POST', body });
