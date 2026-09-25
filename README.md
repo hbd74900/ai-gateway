@@ -20,6 +20,8 @@ OpenAI 兼容的 API 代理网关。支持多上游服务、多 Key 负载均衡
 - **API Key 鉴权**：生成客户端 API Key，控制代理访问权限
 - **OpenAI 兼容**：支持 `/v1/chat/completions`、`/v1/embeddings`、`/v1/models`
 - **流式支持**：完整支持 SSE 流式响应
+- **Claude Messages / OpenAI Responses**：支持 Claude thinking、工具调用、结构化输出，以及 Codex Responses 流式协议
+- **原生协议优先**：OpenRouter、OpenAI、Anthropic 及兼容代理可自动走原生 `/messages` / `/responses`，避免协议降级丢失能力
 
 ## 快速部署
 
@@ -78,6 +80,7 @@ npm run dev
   - **Models**: 该渠道支持的模型，每行一个（留空表示接受所有模型）
   - **Priority**: 优先级（数字越小越优先）
   - **Weight**: 权重（同优先级内的流量分配比例）
+  - **Responses API mode / Claude Messages mode**: 通常保持“自动检测”；私有协议代理可选择“原生协议”或“Chat 转换”
 
 ### 2. 生成客户端 API Key
 
@@ -130,8 +133,17 @@ curl -X POST https://your-worker.workers.dev/v1/chat/completions \
 | GET | `/` | 健康检查 |
 | GET | `/admin` | 管理面板 |
 | POST | `/v1/chat/completions` | 聊天补全（支持流式） |
+| POST | `/v1/messages` | Claude Messages API（支持 thinking、工具和原生 Anthropic 兼容上游） |
+| POST | `/v1/messages/count_tokens` | Claude token 计数（原生上游精确计数，Chat 上游使用估算） |
+| POST | `/v1/responses` | OpenAI Responses API（Codex 兼容） |
 | POST | `/v1/embeddings` | 文本嵌入 |
 | GET | `/v1/models` | 模型列表 |
+
+## 协议兼容说明
+
+详细的 Claude/Codex 协议字段、原生端点选择、Chat 降级边界及官方依据见：
+
+- [`docs/protocol-compatibility.md`](docs/protocol-compatibility.md)
 
 ## 环境变量
 
